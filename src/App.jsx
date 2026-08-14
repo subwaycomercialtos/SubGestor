@@ -36,10 +36,12 @@ const T = {
 
 const AREAS = ["almacen", "congelador", "refrigerador", "barra"];
 const AREA_LABELS = { almacen: "Almacén", congelador: "Congelador", refrigerador: "Refrigerador", barra: "Barra" };
+const MERMA_CLASS = { caducidad: "Caducidad", mal_estado: "Mal estado", produccion: "Producción" };
+const MERMA_UNITS = ["Piezas", "Kg", "Litros", "Otro"];
 const MODULES = {
   dashboard: "Dashboard", productos: "Productos", proveedores: "Proveedores", sucursales: "Sucursales",
   usuarios: "Usuarios", facturas: "Facturas", inventario: "Inventario físico", alertas: "Alertas de caducidad",
-  pedidos: "Pedidos sugeridos", reportes: "Reportes", bitacora: "Bitácora", config: "Configuración", auth: "Autenticación",
+  mermas: "Mermas", pedidos: "Pedidos sugeridos", reportes: "Reportes", bitacora: "Bitácora", config: "Configuración", auth: "Autenticación",
 };
 
 /* ============================== HELPERS ============================== */
@@ -120,6 +122,20 @@ function reconcileLotsForCount(lots, productId, branchId, newTotal) {
     });
   }
   return [...others, ...updated];
+}
+
+/* Descuenta piezas del inventario teórico de un producto/sucursal por una merma
+   (formato FEFO, reutilizando la misma lógica de conciliación de lotes). Nunca
+   deja existencias negativas. */
+function deductFromLots(lots, productId, branchId, qty) {
+  const current = theoreticalStock(lots, productId, branchId);
+  return reconcileLotsForCount(lots, productId, branchId, Math.max(0, current - qty));
+}
+
+/* Devuelve piezas al inventario teórico (por ejemplo, al cancelar una merma). */
+function restoreToLots(lots, productId, branchId, qty) {
+  const current = theoreticalStock(lots, productId, branchId);
+  return reconcileLotsForCount(lots, productId, branchId, current + qty);
 }
 
 function computeSuggestedOrders(state, branchId) {
@@ -502,7 +518,7 @@ function Sidebar({ view, setView, role, onLogout }) {
   const general = [
     ["dashboard", LayoutDashboard], ["productos", Package], ["proveedores", Truck],
     ["facturas", FileText], ["inventario", ClipboardList], ["alertas", AlertTriangle],
-    ["pedidos", ShoppingCart], ["reportes", BarChart3],
+    ["mermas", Trash2], ["pedidos", ShoppingCart], ["reportes", BarChart3],
   ];
   const adminOnly = [["sucursales", Building2], ["usuarios", UsersIcon], ["bitacora", ScrollText], ["config", SettingsIcon]];
   const items = role === "general_admin" ? [...general.slice(0, 3), ...adminOnly.slice(0, 2), ...general.slice(3), ...adminOnly.slice(2)] : general;
@@ -573,7 +589,7 @@ function DashboardView({ state, activeBranchId }) {
   const pendingInvoices = state.invoices.filter((i) => i.status === "pending" && branchIds.includes(i.branchId)).length;
   const inventoryValue = state.lots.filter((l) => l.status === "active" && branchIds.includes(l.branchId)).reduce((s, l) => s + l.remainingPieces * (l.costPerUnit || 0), 0);
   const soon = state.lots.filter((l) => l.status === "active" && branchIds.includes(l.branchId) && ["yellow", "orange", "red"].includes(semaphoreLevel(l.expirationDate, state.config))).length;
-  const mermasMonth = state.mermas.filter((m) => branchIds.includes(m.branchId) && m.date.slice(0, 7) === todayISO().slice(0, 7)).reduce((s, m) => s + m.piecesLost, 0);
+  const mermasMonth = state.mermas.filter((m) => branchIds.includes(m.branchId) && m.status !== "cancelled" && m.date.slice(0, 7) === todayISO().slice(0, 7)).reduce((s, m) => s + m.quantity, 0);
 
   const consumptionByBranch = state.branches.map((b) => {
     const total = state.physicalInventories.filter((pi) => pi.branchId === b.id && pi.status === "active")
@@ -1264,12 +1280,20 @@ function ExpiryAlertsView({ state, mutate, branches, activeBranchId, currentUser
     .sort((a, b) => a.expirationDate.localeCompare(b.expirationDate));
 
   const registerMerma = (lot) => {
+    const qty = lot.remainingPieces;
     mutate((s) => ({
       ...s,
       lots: s.lots.map((l) => (l.id === lot.id ? { ...l, remainingPieces: 0, status: "merma" } : l)),
-      mermas: [...s.mermas, { id: uid("merma"), lotId: lot.id, productId: lot.productId, branchId: lot.branchId, piecesLost: lot.remainingPieces, date: todayISO(), registeredBy: currentUser.name }],
+      mermas: [...s.mermas, {
+        id: uid("merma"), lotId: lot.id, productId: lot.productId, branchId: lot.branchId,
+        date: todayISO(), quantity: qty, unit: "Piezas",
+        unitCost: lot.costPerUnit, totalCost: qty * lot.costPerUnit,
+        classification: "caducidad", reason: "Producto caducado (semáforo de alertas)",
+        responsible: currentUser.name, observations: "", photoEvidence: null,
+        status: "active", createdBy: currentUser.name, createdAt: nowStamp(),
+      }],
     }));
-    audit("Alertas de caducidad", `Registró merma de ${lot.remainingPieces} pz — ${state.products.find((p) => p.id === lot.productId)?.name}`);
+    audit("Alertas de caducidad", `Registró merma de ${qty} pz — ${state.products.find((p) => p.id === lot.productId)?.name}`);
   };
 
   const exportRows = lots.map((l) => ({
@@ -1308,6 +1332,201 @@ function ExpiryAlertsView({ state, mutate, branches, activeBranchId, currentUser
         </table>
         {!lots.length && <EmptyState text="No hay lotes en este filtro." />}
       </Card>
+    </div>
+  );
+}
+
+/* ============================== MERMAS ============================== */
+function MermaForm({ state, branches, forcedBranchId, onSave, onClose }) {
+  const products = state.products.filter((p) => p.status === "active");
+  const [f, setF] = useState({
+    productId: products[0]?.id || "", branchId: forcedBranchId || branches[0]?.id || "",
+    date: todayISO(), quantity: 0, unit: "Piezas", unitCost: 0,
+    classification: "caducidad", reason: "", observations: "", photoEvidence: null,
+  });
+  const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
+
+  const onProductChange = (productId) => {
+    const prod = state.products.find((p) => p.id === productId);
+    const suggestedCost = prod && prod.lastCostPerPackage != null && prod.piecesPerPackage
+      ? +(prod.lastCostPerPackage / prod.piecesPerPackage).toFixed(2) : f.unitCost;
+    setF((s) => ({ ...s, productId, unitCost: suggestedCost }));
+  };
+
+  const onPhoto = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader(); reader.onload = () => set("photoEvidence", reader.result); reader.readAsDataURL(file);
+  };
+
+  const totalCost = clampNum(f.quantity) * clampNum(f.unitCost);
+  const valid = f.productId && f.branchId && clampNum(f.quantity) > 0 && f.classification && f.reason.trim();
+
+  return (
+    <Modal title="Registrar merma" onClose={onClose} width={620}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: forcedBranchId ? "1fr 1fr" : "1fr 1fr 1fr", gap: 10 }}>
+          <Field label="Producto">
+            <Select value={f.productId} onChange={(e) => onProductChange(e.target.value)}>
+              {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </Select>
+          </Field>
+          {!forcedBranchId && (
+            <Field label="Sucursal">
+              <Select value={f.branchId} onChange={(e) => set("branchId", e.target.value)}>
+                {branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </Select>
+            </Field>
+          )}
+          <Field label="Fecha"><TextInput type="date" value={f.date} onChange={(e) => set("date", e.target.value)} /></Field>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          <Field label="Cantidad"><TextInput type="number" min="0" value={f.quantity} onChange={(e) => set("quantity", clampNum(e.target.value))} /></Field>
+          <Field label="Unidad de medida">
+            <Select value={f.unit} onChange={(e) => set("unit", e.target.value)}>
+              {MERMA_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+            </Select>
+          </Field>
+          <Field label="Costo unitario"><TextInput type="number" min="0" step="0.01" value={f.unitCost} onChange={(e) => set("unitCost", clampNum(e.target.value))} /></Field>
+        </div>
+        <div style={{ textAlign: "right", fontSize: 13, color: T.gray500 }}>Costo total de la merma: <b style={{ color: T.ink }}>{fmtMoney(totalCost)}</b></div>
+        <Field label="Clasificación">
+          <Select value={f.classification} onChange={(e) => set("classification", e.target.value)}>
+            {Object.entries(MERMA_CLASS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </Select>
+        </Field>
+        <Field label="Motivo de la merma"><TextInput value={f.reason} onChange={(e) => set("reason", e.target.value)} placeholder="Ej. golpeado en transporte, refrigerador descompuesto…" /></Field>
+        <Field label="Observaciones (opcional)"><TextArea rows={2} value={f.observations} onChange={(e) => set("observations", e.target.value)} /></Field>
+        <Field label="Evidencia fotográfica (opcional)">
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {f.photoEvidence ? <img src={f.photoEvidence} alt="" style={{ width: 56, height: 56, borderRadius: 8, objectFit: "cover" }} /> : <div style={{ width: 56, height: 56, borderRadius: 8, background: T.green100, display: "flex", alignItems: "center", justifyContent: "center" }}><ImageIcon size={18} color={T.green700} /></div>}
+            <input type="file" accept="image/*" onChange={onPhoto} style={{ fontSize: 12 }} />
+          </div>
+        </Field>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
+          <Btn variant="ghost" onClick={onClose}>Cancelar</Btn>
+          <Btn disabled={!valid} icon={CheckCircle2} onClick={() => onSave({ ...f, quantity: clampNum(f.quantity), unitCost: clampNum(f.unitCost), totalCost })}>Guardar merma</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function MermaClassPill({ classification }) {
+  const map = { caducidad: [T.gray300, T.expired], mal_estado: ["#FDE6D2", T.orange], produccion: [T.green100, T.green700] };
+  const [bg, fg] = map[classification] || [T.gray300, T.gray500];
+  return <Pill bg={bg} fg={fg}>{MERMA_CLASS[classification] || classification}</Pill>;
+}
+
+function MermasView({ state, mutate, branches, activeBranchId, currentUser, audit }) {
+  const isGeneral = currentUser.role === "general_admin";
+  const branchId = isGeneral ? activeBranchId : currentUser.branchId;
+  const [showForm, setShowForm] = useState(false);
+  const [classFilter, setClassFilter] = useState("all");
+  const [cancelTarget, setCancelTarget] = useState(null);
+  const [cancelReason, setCancelReason] = useState("");
+  const [evidenceView, setEvidenceView] = useState(null);
+
+  const list = state.mermas
+    .filter((m) => !branchId || m.branchId === branchId)
+    .filter((m) => classFilter === "all" || m.classification === classFilter)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const createMerma = (f) => {
+    mutate((s) => ({
+      ...s,
+      lots: deductFromLots(s.lots, f.productId, f.branchId, f.quantity),
+      mermas: [...s.mermas, {
+        id: uid("merma"), lotId: null, productId: f.productId, branchId: f.branchId,
+        date: f.date, quantity: f.quantity, unit: f.unit, unitCost: f.unitCost, totalCost: f.totalCost,
+        classification: f.classification, reason: f.reason, observations: f.observations, photoEvidence: f.photoEvidence,
+        responsible: currentUser.name, status: "active",
+        createdBy: currentUser.name, createdAt: nowStamp(),
+      }],
+    }));
+    audit("Mermas", `Registró merma de ${f.quantity} ${f.unit} — ${state.products.find((p) => p.id === f.productId)?.name} (${MERMA_CLASS[f.classification]})`);
+    setShowForm(false);
+  };
+
+  const doCancel = () => {
+    mutate((s) => ({
+      ...s,
+      lots: restoreToLots(s.lots, cancelTarget.productId, cancelTarget.branchId, cancelTarget.quantity),
+      mermas: s.mermas.map((m) => (m.id === cancelTarget.id ? { ...m, status: "cancelled", cancelReason, cancelledBy: currentUser.name, cancelledAt: nowStamp() } : m)),
+    }));
+    audit("Mermas", `Canceló la merma de ${state.products.find((p) => p.id === cancelTarget.productId)?.name} — motivo: ${cancelReason}`);
+    setCancelTarget(null); setCancelReason("");
+  };
+
+  const exportRows = list.map((m) => ({
+    Fecha: fmtDate(m.date), Producto: state.products.find((p) => p.id === m.productId)?.name || "—",
+    Sucursal: state.branches.find((b) => b.id === m.branchId)?.name || "—",
+    Clasificación: MERMA_CLASS[m.classification] || m.classification, Cantidad: m.quantity, Unidad: m.unit,
+    "Costo total": fmtMoney(m.totalCost), Motivo: m.reason, Responsable: m.responsible,
+    Estado: m.status === "cancelled" ? "Cancelada" : "Activa",
+  }));
+
+  const totalCostShown = list.filter((m) => m.status !== "cancelled").reduce((s, m) => s + m.totalCost, 0);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <ExportBar rows={exportRows} label="mermas" />
+          <Select value={classFilter} onChange={(e) => setClassFilter(e.target.value)}>
+            <option value="all">Todas las clasificaciones</option>
+            {Object.entries(MERMA_CLASS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </Select>
+        </div>
+        <Btn icon={Plus} onClick={() => setShowForm(true)}>Registrar merma</Btn>
+      </div>
+      <Card style={{ marginBottom: 14, borderTop: `3px solid ${T.red}` }}>
+        <div style={{ fontSize: 11.5, color: T.gray500, fontWeight: 700, textTransform: "uppercase" }}>Costo total de mermas (filtro actual)</div>
+        <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 24, fontWeight: 700, color: T.ink }}>{fmtMoney(totalCostShown)}</div>
+      </Card>
+      <Card style={{ padding: 0, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><Th>Fecha</Th><Th>Producto</Th><Th>Sucursal</Th><Th>Clasificación</Th><Th>Cantidad</Th><Th>Costo total</Th><Th>Responsable</Th><Th>Estado</Th><Th></Th></tr></thead>
+          <tbody>
+            {list.map((m) => (
+              <tr key={m.id}>
+                <Td>{fmtDate(m.date)}</Td>
+                <Td><b>{state.products.find((p) => p.id === m.productId)?.name || "—"}</b></Td>
+                <Td>{state.branches.find((b) => b.id === m.branchId)?.name || "—"}</Td>
+                <Td><MermaClassPill classification={m.classification} /></Td>
+                <Td>{m.quantity} {m.unit}</Td>
+                <Td>{fmtMoney(m.totalCost)}</Td>
+                <Td>{m.responsible}</Td>
+                <Td><StatusPill status={m.status === "cancelled" ? "cancelled" : "active"} /></Td>
+                <Td>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {m.photoEvidence && <Btn small variant="ghost" onClick={() => setEvidenceView(m.photoEvidence)}>Ver foto</Btn>}
+                    {m.status !== "cancelled" && <Btn small variant="danger" onClick={() => setCancelTarget(m)}>Cancelar</Btn>}
+                  </div>
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!list.length && <EmptyState text="No hay mermas registradas para este filtro." />}
+      </Card>
+      {showForm && (
+        <MermaForm state={state} branches={branches} forcedBranchId={isGeneral ? null : currentUser.branchId} onSave={createMerma} onClose={() => setShowForm(false)} />
+      )}
+      {cancelTarget && (
+        <Modal title="Cancelar merma" onClose={() => setCancelTarget(null)} width={400}>
+          <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>Esto restituye {cancelTarget.quantity} {cancelTarget.unit} al inventario y conserva el registro original para auditoría — no se elimina.</p>
+          <Field label="Motivo de la cancelación"><TextArea rows={3} value={cancelReason} onChange={(e) => setCancelReason(e.target.value)} /></Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+            <Btn variant="ghost" onClick={() => setCancelTarget(null)}>Volver</Btn>
+            <Btn variant="danger" disabled={!cancelReason.trim()} onClick={doCancel}>Confirmar cancelación</Btn>
+          </div>
+        </Modal>
+      )}
+      {evidenceView && (
+        <Modal title="Evidencia fotográfica" onClose={() => setEvidenceView(null)} width={480}>
+          <img src={evidenceView} alt="Evidencia de merma" style={{ width: "100%", borderRadius: 10 }} />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -1366,7 +1585,7 @@ function ReportsView({ state, branches }) {
     rows = state.lots.filter((l) => l.status === "active" && l.expirationDate && l.remainingPieces > 0 && (branchFilter === "all" || l.branchId === branchFilter) && ["yellow", "orange", "red"].includes(semaphoreLevel(l.expirationDate, state.config)))
       .map((l) => ({ Producto: state.products.find((p) => p.id === l.productId)?.name, Sucursal: state.branches.find((b) => b.id === l.branchId)?.name, Caducidad: fmtDate(l.expirationDate), Piezas: l.remainingPieces, Nivel: SEM_META[semaphoreLevel(l.expirationDate, state.config)].label }));
   } else if (type === "Mermas por caducidad") {
-    rows = state.mermas.filter((m) => branchFilter === "all" || m.branchId === branchFilter).map((m) => ({ Producto: state.products.find((p) => p.id === m.productId)?.name, Sucursal: state.branches.find((b) => b.id === m.branchId)?.name, Fecha: fmtDate(m.date), "Piezas perdidas": m.piecesLost, "Registró": m.registeredBy }));
+    rows = state.mermas.filter((m) => (branchFilter === "all" || m.branchId === branchFilter) && m.status !== "cancelled").map((m) => ({ Producto: state.products.find((p) => p.id === m.productId)?.name, Sucursal: state.branches.find((b) => b.id === m.branchId)?.name, Fecha: fmtDate(m.date), Clasificación: MERMA_CLASS[m.classification] || m.classification, Cantidad: m.quantity, Unidad: m.unit, "Costo total": fmtMoney(m.totalCost), Responsable: m.responsible }));
   } else if (type === "Facturas pendientes de pago" || type === "Facturas pagadas") {
     const st = type === "Facturas pagadas" ? "paid" : "pending";
     rows = state.invoices.filter((i) => i.status === st && (branchFilter === "all" || i.branchId === branchFilter)).map((i) => ({ Factura: i.invoiceNumber, Proveedor: state.suppliers.find((s) => s.id === i.supplierId)?.name, Sucursal: state.branches.find((b) => b.id === i.branchId)?.name, Ingreso: fmtDate(i.entryDate), Total: fmtMoney(i.total) }));
@@ -1615,6 +1834,7 @@ function SubGestorAppInner() {
   else if (view === "facturas") content = <InvoicesView {...viewProps} />;
   else if (view === "inventario") content = <PhysicalInventoryView {...viewProps} />;
   else if (view === "alertas") content = <ExpiryAlertsView {...viewProps} />;
+  else if (view === "mermas") content = <MermasView {...viewProps} />;
   else if (view === "pedidos") content = <SuggestedOrdersView {...viewProps} />;
   else if (view === "reportes") content = <ReportsView state={state} branches={branches} />;
   else if (view === "bitacora") content = session.user.role === "general_admin" ? <AuditLogView state={state} /> : null;
