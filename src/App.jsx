@@ -695,7 +695,7 @@ function Sidebar({ view, setView, role, onLogout }) {
   const general = [
     ["dashboard", LayoutDashboard], ["productos", Package], ["proveedores", Truck],
     ["facturas", FileText], ["inventario", ClipboardList], ["alertas", AlertTriangle],
-    ["mermas", Trash2], ["pedidos", ShoppingCart], ["reportes", BarChart3],
+    ["mermas", Trash2], ["pedidos", ShoppingCart],
   ];
   const adminOnly = [["sucursales", Building2], ["usuarios", UsersIcon], ["bitacora", ScrollText], ["config", SettingsIcon]];
   const items = role === "general_admin" ? [...general.slice(0, 3), ...adminOnly.slice(0, 2), ...general.slice(3), ...adminOnly.slice(2)] : general;
@@ -758,7 +758,36 @@ function KpiCard({ label, value, sub, accent }) {
 }
 const PIE_COLORS = [T.ok, T.amber, T.orange, T.red, T.expired];
 
-function DashboardView({ state, activeBranchId, role, onNavigate }) {
+function DashboardView({ state, activeBranchId, role, currentUser, branches }) {
+  const [tab, setTab] = useState("general");
+  const isGeneral = role === "general_admin";
+  const branchId = isGeneral ? activeBranchId : currentUser.branchId;
+  const targetBranches = branchId ? state.branches.filter((b) => b.id === branchId) : state.branches;
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
+        {[["general", "General"], ["mermas", "Mermas"], ["reportes", "Reportes"]].map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+        ))}
+      </div>
+      {tab === "general" && <DashboardGeneralTab state={state} activeBranchId={activeBranchId} role={role} onGoToMermas={() => setTab("mermas")} />}
+      {tab === "mermas" && (
+        <div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
+            {targetBranches.map((b) => <MermaStandardCard key={b.id} status={computeMermaStandardStatus(state, b.id, state.config.mermaPeriod || "mensual")} />)}
+          </div>
+          <MermasAnalyticsPanel state={state} isGeneral={isGeneral} branchId={branchId} />
+          <div style={{ height: 14 }} />
+          <MermasCrossAnalysisPanel state={state} branchId={branchId} />
+        </div>
+      )}
+      {tab === "reportes" && <ReportsView state={state} branches={branches} />}
+    </div>
+  );
+}
+
+function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
   const branches = activeBranchId ? state.branches.filter((b) => b.id === activeBranchId) : state.branches;
   const branchIds = branches.map((b) => b.id);
 
@@ -810,7 +839,7 @@ function DashboardView({ state, activeBranchId, role, onNavigate }) {
         <ExportBar rows={exportRows} label="dashboard" />
       </div>
       {mermaAlerts.length > 0 && (
-        <Card style={{ borderTop: `3px solid ${T.red}`, cursor: onNavigate ? "pointer" : "default" }} onClick={() => onNavigate && onNavigate("mermas")}>
+        <Card style={{ borderTop: `3px solid ${T.red}`, cursor: onGoToMermas ? "pointer" : "default" }} onClick={() => onGoToMermas && onGoToMermas()}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 700, color: T.red }}>
             <AlertTriangle size={16} /> {mermaAlerts.length} sucursal(es) cerca o por encima de su estándar de merma
           </div>
@@ -821,7 +850,7 @@ function DashboardView({ state, activeBranchId, role, onNavigate }) {
               </Pill>
             ))}
           </div>
-          <div style={{ fontSize: 11.5, color: T.gray500, marginTop: 8 }}>Clic para ver el detalle en el módulo de Mermas.</div>
+          <div style={{ fontSize: 11.5, color: T.gray500, marginTop: 8 }}>Clic para ver el detalle en la pestaña de Mermas.</div>
         </Card>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 14 }}>
@@ -1841,7 +1870,6 @@ function MermasAnalyticsPanel({ state, isGeneral, branchId }) {
 function MermasView({ state, mutate, branches, activeBranchId, currentUser, audit }) {
   const isGeneral = currentUser.role === "general_admin";
   const branchId = isGeneral ? activeBranchId : currentUser.branchId;
-  const [tab, setTab] = useState("registro");
   const [showForm, setShowForm] = useState(false);
   const [classFilter, setClassFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -1910,19 +1938,9 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
   }));
 
   const totalCostShown = list.filter((m) => m.status !== "cancelled").reduce((s, m) => s + m.totalCost, 0);
-  const targetBranches = branchId ? state.branches.filter((b) => b.id === branchId) : state.branches;
-  const standardStatuses = targetBranches.map((b) => computeMermaStandardStatus(state, b.id, state.config.mermaPeriod || "mensual"));
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
-        {[["registro", "Registro"], ["analisis", "Panel de análisis"], ["integracion", "Integración"]].map(([k, label]) => (
-          <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
-        ))}
-      </div>
-      {tab === "analisis" && <MermasAnalyticsPanel state={state} isGeneral={isGeneral} branchId={branchId} />}
-      {tab === "integracion" && <MermasCrossAnalysisPanel state={state} branchId={branchId} />}
-      {tab === "registro" && (<>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <ExportBar rows={exportRows} label="mermas" />
@@ -1938,9 +1956,6 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
           </Select>
         </div>
         <Btn icon={Plus} onClick={() => setShowForm(true)}>Registrar merma</Btn>
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
-        {standardStatuses.map((st) => <MermaStandardCard key={st.branchId} status={st} />)}
       </div>
       <Card style={{ marginBottom: 14, borderTop: `3px solid ${T.red}` }}>
         <div style={{ fontSize: 11.5, color: T.gray500, fontWeight: 700, textTransform: "uppercase" }}>Costo total de mermas (filtro actual)</div>
@@ -2002,7 +2017,6 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
           <img src={evidenceView} alt="Evidencia de merma" style={{ width: "100%", borderRadius: 10 }} />
         </Modal>
       )}
-      </>)}
     </div>
   );
 }
@@ -2310,7 +2324,7 @@ function SubGestorAppInner() {
   const viewProps = { state, mutate, branches, activeBranchId, currentUser: session.user, audit };
 
   let content;
-  if (view === "dashboard") content = <DashboardView state={state} activeBranchId={session.user.role === "branch_admin" ? session.user.branchId : activeBranchId} role={session.user.role} onNavigate={setView} />;
+  if (view === "dashboard") content = <DashboardView state={state} activeBranchId={session.user.role === "branch_admin" ? session.user.branchId : activeBranchId} role={session.user.role} currentUser={session.user} branches={branches} />;
   else if (view === "productos") content = <ProductsView {...viewProps} activeBranchId={session.user.role === "branch_admin" ? session.user.branchId : activeBranchId} />;
   else if (view === "proveedores") content = <SuppliersView {...viewProps} />;
   else if (view === "sucursales") content = session.user.role === "general_admin" ? <BranchesView {...viewProps} /> : null;
@@ -2320,7 +2334,6 @@ function SubGestorAppInner() {
   else if (view === "alertas") content = <ExpiryAlertsView {...viewProps} />;
   else if (view === "mermas") content = <MermasView {...viewProps} />;
   else if (view === "pedidos") content = <SuggestedOrdersView {...viewProps} />;
-  else if (view === "reportes") content = <ReportsView state={state} branches={branches} />;
   else if (view === "bitacora") content = session.user.role === "general_admin" ? <AuditLogView state={state} /> : null;
   else if (view === "config") content = session.user.role === "general_admin" ? <ConfigView {...viewProps} onReset={resetToFactory} /> : null;
 
