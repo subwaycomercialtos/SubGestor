@@ -101,24 +101,24 @@ function reconcileLotsForCount(lots, productId, branchId, newTotal) {
     if (!b.expirationDate) return -1;
     return a.expirationDate.localeCompare(b.expirationDate);
   });
-  let remaining = newTotal;
-  const updated = [];
-  for (const lot of sorted) {
-    if (remaining <= 0) {
-      updated.push({ ...lot, remainingPieces: 0, status: lot.remainingPieces > 0 ? "agotado" : lot.status });
-    } else if (lot.remainingPieces <= remaining) {
-      remaining -= lot.remainingPieces;
-      updated.push({ ...lot });
-    } else {
-      updated.push({ ...lot, remainingPieces: remaining });
-      remaining = 0;
+  const currentTotal = sorted.reduce((s, l) => s + l.remainingPieces, 0);
+  let toRemove = Math.max(0, currentTotal - newTotal);
+  const updated = sorted.map((lot) => {
+    if (toRemove <= 0) return { ...lot };
+    if (lot.remainingPieces <= toRemove) {
+      toRemove -= lot.remainingPieces;
+      return { ...lot, remainingPieces: 0, status: "agotado" };
     }
-  }
-  if (remaining > 0) {
+    const newRemaining = lot.remainingPieces - toRemove;
+    toRemove = 0;
+    return { ...lot, remainingPieces: newRemaining };
+  });
+  const surplus = Math.max(0, newTotal - currentTotal);
+  if (surplus > 0) {
     updated.push({
       id: uid("lot"), invoiceId: null, productId, branchId,
       expirationDate: null, entryDate: todayISO(),
-      initialPieces: remaining, remainingPieces: remaining,
+      initialPieces: surplus, remainingPieces: surplus,
       costPerUnit: 0, status: "active", source: "ajuste",
     });
   }
@@ -278,6 +278,36 @@ function computeMermaAnalytics(state, filters) {
   return { mermas, totalCost, totalCount: mermas.length, porSucursal, porProducto, porCategoria, evolucion };
 }
 
+/* Integración cruzada: por producto, muestra cuánto se compró, cuánto se
+   consumió (estimado con el costo unitario más reciente, ya que el consumo
+   histórico no guarda su propio costo), cuánto se perdió en mermas, y cuánto
+   queda en existencia — igual que pide la especificación
+   (Compras → Entradas → Inventario → Consumo → Mermas → Existencia final). */
+function computeCrossAnalysis(state, branchId, start, end) {
+  const products = state.products.filter((p) => p.status === "active");
+  return products.map((p) => {
+    const relevantInvoices = state.invoices.filter((i) => i.status !== "cancelled" && (!branchId || i.branchId === branchId) && i.entryDate >= start && i.entryDate <= end);
+    let comprado = 0;
+    relevantInvoices.forEach((inv) => {
+      inv.items.forEach((it) => {
+        if (it.productId === p.id) comprado += it.packages * it.costPerPackage + (it.looseUnits || 0) * (it.costPerPackage / p.piecesPerPackage);
+      });
+    });
+    const estUnitCost = p.lastCostPerPackage != null ? p.lastCostPerPackage / p.piecesPerPackage : 0;
+    const relevantPI = state.physicalInventories.filter((pi) => pi.status === "active" && (!branchId || pi.branchId === branchId) && pi.date >= start && pi.date <= end);
+    let consumido = 0;
+    relevantPI.forEach((pi) => {
+      const c = pi.consumption.find((c) => c.productId === p.id);
+      if (c) consumido += c.consumedPieces * estUnitCost;
+    });
+    const mermaCost = state.mermas.filter((m) => m.status !== "cancelled" && m.productId === p.id && (!branchId || m.branchId === branchId) && m.date >= start && m.date <= end)
+      .reduce((s, m) => s + m.totalCost, 0);
+    const existencia = state.lots.filter((l) => l.productId === p.id && l.status === "active" && (!branchId || l.branchId === branchId))
+      .reduce((s, l) => s + l.remainingPieces * (l.costPerUnit || 0), 0);
+    return { productId: p.id, name: p.name, comprado, consumido, mermaCost, existencia };
+  }).filter((r) => r.comprado > 0 || r.consumido > 0 || r.mermaCost > 0 || r.existencia > 0);
+}
+
 const MERMA_ESTADO_META = {
   dentro: { bg: "#E7F2E9", fg: "#1E5631", label: "Dentro del estándar" },
   advertencia: { bg: "#FDF3D0", fg: "#D99E00", label: "Advertencia" },
@@ -329,7 +359,7 @@ function seedState() {
       { id: uid("usr"), username: "100", password: "1234", role: "branch_admin", name: "Encargado Sucursal Centro", branchId, status: "active", failedAttempts: 0, lockedUntil: null, lastLogin: null },
     ],
     auditLog: [],
-    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual" },
+    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual", mermaApprovalThreshold: null },
   };
 }
 
@@ -373,7 +403,7 @@ function StatusPill({ status }) {
   const map = {
     active: [T.green100, T.green700, "Activo"], disabled: [T.gray300, T.gray500, "Desactivado"],
     pending: [T.yellow100, T.yellow600, "Pendiente de pago"], paid: [T.green100, T.green700, "Pagada"],
-    cancelled: [T.gray300, T.gray500, "Cancelada"],
+    cancelled: [T.gray300, T.gray500, "Cancelada"], pending_approval: [T.yellow100, T.yellow600, "Pendiente de aprobación"],
   };
   const [bg, fg, label] = map[status] || [T.gray300, T.gray500, status];
   return <Pill bg={bg} fg={fg}>{label}</Pill>;
@@ -1631,6 +1661,54 @@ function MermaStandardCard({ status }) {
 
 const MERMA_PIE_COLORS = [T.expired, T.orange, T.green700];
 
+function MermasCrossAnalysisPanel({ state, branchId }) {
+  const period = state.config.mermaPeriod || "mensual";
+  const { start, end } = getPeriodRange(period);
+  const rows = computeCrossAnalysis(state, branchId, start, end);
+  const totals = rows.reduce((acc, r) => ({
+    comprado: acc.comprado + r.comprado, consumido: acc.consumido + r.consumido,
+    mermaCost: acc.mermaCost + r.mermaCost, existencia: acc.existencia + r.existencia,
+  }), { comprado: 0, consumido: 0, mermaCost: 0, existencia: 0 });
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 13, color: T.gray500 }}>
+          Compara, por producto, el flujo completo: <b style={{ color: T.ink }}>Compras → Consumo → Mermas → Existencia final</b>, para el periodo {MERMA_PERIODS[period].toLowerCase()} actual ({fmtDate(start)} – {fmtDate(end)}).
+          El consumo se estima con el costo más reciente de cada producto, ya que el historial de consumo no guarda su propio costo.
+        </div>
+      </Card>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 14 }}>
+        <KpiCard label="Comprado" value={fmtMoney(totals.comprado)} accent={T.green700} />
+        <KpiCard label="Consumido (estimado)" value={fmtMoney(totals.consumido)} accent={T.green600} />
+        <KpiCard label="Mermas" value={fmtMoney(totals.mermaCost)} accent={T.red} />
+        <KpiCard label="Existencia final" value={fmtMoney(totals.existencia)} accent={T.yellow600} />
+      </div>
+      <Card style={{ padding: 0, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><Th>Producto</Th><Th>Comprado</Th><Th>Consumido (est.)</Th><Th>Mermas</Th><Th>Existencia final</Th><Th>Diferencia</Th></tr></thead>
+          <tbody>
+            {rows.map((r) => {
+              const diferencia = r.comprado - r.consumido - r.mermaCost - r.existencia;
+              return (
+                <tr key={r.productId}>
+                  <Td><b>{r.name}</b></Td>
+                  <Td>{fmtMoney(r.comprado)}</Td>
+                  <Td>{fmtMoney(r.consumido)}</Td>
+                  <Td>{fmtMoney(r.mermaCost)}</Td>
+                  <Td>{fmtMoney(r.existencia)}</Td>
+                  <Td><span style={{ color: Math.abs(diferencia) > 1 ? T.orange : T.gray500 }}>{fmtMoney(diferencia)}</span></Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {!rows.length && <EmptyState text="No hay movimientos en este periodo para comparar." />}
+      </Card>
+    </div>
+  );
+}
+
 function MermasAnalyticsPanel({ state, isGeneral, branchId }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -1766,17 +1844,23 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
   const [tab, setTab] = useState("registro");
   const [showForm, setShowForm] = useState(false);
   const [classFilter, setClassFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
   const [cancelTarget, setCancelTarget] = useState(null);
   const [cancelReason, setCancelReason] = useState("");
+  const [rejectTarget, setRejectTarget] = useState(null);
+  const [rejectReason, setRejectReason] = useState("");
   const [evidenceView, setEvidenceView] = useState(null);
 
   const list = state.mermas
     .filter((m) => !branchId || m.branchId === branchId)
     .filter((m) => classFilter === "all" || m.classification === classFilter)
+    .filter((m) => statusFilter === "all" || (statusFilter === "active" ? m.status === "active" : m.status === statusFilter))
     .sort((a, b) => b.date.localeCompare(a.date));
 
   const createMerma = (f) => {
     const costCalc = computeFEFOCost(state.lots, f.productId, f.branchId, f.quantity);
+    const threshold = state.config.mermaApprovalThreshold;
+    const needsApproval = !isGeneral && threshold != null && threshold > 0 && costCalc.totalCost >= threshold;
     mutate((s) => ({
       ...s,
       lots: deductFromLots(s.lots, f.productId, f.branchId, f.quantity),
@@ -1784,12 +1868,27 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
         id: uid("merma"), lotId: null, productId: f.productId, branchId: f.branchId,
         date: f.date, quantity: costCalc.consumed, unit: f.unit, unitCost: costCalc.unitCost, totalCost: costCalc.totalCost,
         classification: f.classification, reason: f.reason, observations: f.observations, photoEvidence: f.photoEvidence,
-        responsible: currentUser.name, status: "active",
+        responsible: currentUser.name, status: needsApproval ? "pending_approval" : "active",
         createdBy: currentUser.name, createdAt: nowStamp(),
       }],
     }));
-    audit("Mermas", `Registró merma de ${costCalc.consumed} ${f.unit} — ${state.products.find((p) => p.id === f.productId)?.name} (${MERMA_CLASS[f.classification]})`);
+    audit("Mermas", `Registró merma de ${costCalc.consumed} ${f.unit} — ${state.products.find((p) => p.id === f.productId)?.name} (${MERMA_CLASS[f.classification]})${needsApproval ? " — pendiente de aprobación" : ""}`);
     setShowForm(false);
+  };
+
+  const approveMerma = (m) => {
+    mutate((s) => ({ ...s, mermas: s.mermas.map((x) => (x.id === m.id ? { ...x, status: "active", approvedBy: currentUser.name, approvedAt: nowStamp() } : x)) }));
+    audit("Mermas", `Aprobó la merma de ${state.products.find((p) => p.id === m.productId)?.name} (${fmtMoney(m.totalCost)})`);
+  };
+
+  const rejectMerma = () => {
+    mutate((s) => ({
+      ...s,
+      lots: restoreToLots(s.lots, rejectTarget.productId, rejectTarget.branchId, rejectTarget.quantity),
+      mermas: s.mermas.map((m) => (m.id === rejectTarget.id ? { ...m, status: "cancelled", cancelReason: rejectReason, cancelledBy: currentUser.name, cancelledAt: nowStamp() } : m)),
+    }));
+    audit("Mermas", `Rechazó la merma de ${state.products.find((p) => p.id === rejectTarget.productId)?.name} — motivo: ${rejectReason}`);
+    setRejectTarget(null); setRejectReason("");
   };
 
   const doCancel = () => {
@@ -1817,11 +1916,12 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
-        {[["registro", "Registro"], ["analisis", "Panel de análisis"]].map(([k, label]) => (
+        {[["registro", "Registro"], ["analisis", "Panel de análisis"], ["integracion", "Integración"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
       {tab === "analisis" && <MermasAnalyticsPanel state={state} isGeneral={isGeneral} branchId={branchId} />}
+      {tab === "integracion" && <MermasCrossAnalysisPanel state={state} branchId={branchId} />}
       {tab === "registro" && (<>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -1829,6 +1929,12 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
           <Select value={classFilter} onChange={(e) => setClassFilter(e.target.value)}>
             <option value="all">Todas las clasificaciones</option>
             {Object.entries(MERMA_CLASS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </Select>
+          <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">Todos los estados</option>
+            <option value="active">Activas</option>
+            <option value="pending_approval">Pendientes de aprobación</option>
+            <option value="cancelled">Canceladas</option>
           </Select>
         </div>
         <Btn icon={Plus} onClick={() => setShowForm(true)}>Registrar merma</Btn>
@@ -1853,11 +1959,13 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
                 <Td>{m.quantity} {m.unit}</Td>
                 <Td>{fmtMoney(m.totalCost)}</Td>
                 <Td>{m.responsible}</Td>
-                <Td><StatusPill status={m.status === "cancelled" ? "cancelled" : "active"} /></Td>
+                <Td><StatusPill status={m.status === "cancelled" ? "cancelled" : m.status === "pending_approval" ? "pending_approval" : "active"} /></Td>
                 <Td>
-                  <div style={{ display: "flex", gap: 6 }}>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     {m.photoEvidence && <Btn small variant="ghost" onClick={() => setEvidenceView(m.photoEvidence)}>Ver foto</Btn>}
-                    {m.status !== "cancelled" && <Btn small variant="danger" onClick={() => setCancelTarget(m)}>Cancelar</Btn>}
+                    {m.status === "pending_approval" && isGeneral && <Btn small variant="secondary" onClick={() => approveMerma(m)}>Aprobar</Btn>}
+                    {m.status === "pending_approval" && isGeneral && <Btn small variant="danger" onClick={() => setRejectTarget(m)}>Rechazar</Btn>}
+                    {m.status !== "cancelled" && m.status !== "pending_approval" && (isGeneral || !m.approvedBy) && <Btn small variant="danger" onClick={() => setCancelTarget(m)}>Cancelar</Btn>}
                   </div>
                 </Td>
               </tr>
@@ -1876,6 +1984,16 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
             <Btn variant="ghost" onClick={() => setCancelTarget(null)}>Volver</Btn>
             <Btn variant="danger" disabled={!cancelReason.trim()} onClick={doCancel}>Confirmar cancelación</Btn>
+          </div>
+        </Modal>
+      )}
+      {rejectTarget && (
+        <Modal title="Rechazar merma" onClose={() => setRejectTarget(null)} width={400}>
+          <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>Esto restituye {rejectTarget.quantity} {rejectTarget.unit} al inventario y conserva el registro original para auditoría — no se elimina.</p>
+          <Field label="Motivo del rechazo"><TextArea rows={3} value={rejectReason} onChange={(e) => setRejectReason(e.target.value)} /></Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+            <Btn variant="ghost" onClick={() => setRejectTarget(null)}>Volver</Btn>
+            <Btn variant="danger" disabled={!rejectReason.trim()} onClick={rejectMerma}>Confirmar rechazo</Btn>
           </div>
         </Modal>
       )}
@@ -2024,6 +2142,9 @@ function ConfigView({ state, mutate, audit, onReset }) {
             <Select value={cfg.mermaPeriod || "mensual"} onChange={(e) => setCfg({ ...cfg, mermaPeriod: e.target.value })}>
               {Object.entries(MERMA_PERIODS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
             </Select>
+          </Field>
+          <Field label="Monto que requiere autorización del Administrador General" hint="Mermas de una sucursal iguales o mayores a este monto quedan pendientes de aprobación. Déjalo vacío para no requerir autorización.">
+            <TextInput type="number" min="0" step="0.01" value={cfg.mermaApprovalThreshold ?? ""} onChange={(e) => setCfg({ ...cfg, mermaApprovalThreshold: e.target.value === "" ? null : clampNum(e.target.value) })} />
           </Field>
           <Btn icon={CheckCircle2} onClick={save}>Guardar configuración</Btn>
         </div>
