@@ -133,6 +133,29 @@ function deductFromLots(lots, productId, branchId, qty) {
   return reconcileLotsForCount(lots, productId, branchId, Math.max(0, current - qty));
 }
 
+/* Calcula el costo real de dar de baja "qty" piezas de un producto/sucursal,
+   usando el mismo orden FEFO que la deducción de inventario — así el costo
+   de una merma siempre refleja lo que esas piezas costaron realmente al
+   entrar (factura), nunca un valor capturado a mano. Si la cantidad pedida
+   excede lo disponible, calcula sobre lo que realmente hay (consumed). */
+function computeFEFOCost(lots, productId, branchId, qty) {
+  const relevant = lots.filter((l) => l.productId === productId && l.branchId === branchId && l.status === "active");
+  const sorted = [...relevant].sort((a, b) => {
+    if (!a.expirationDate) return 1;
+    if (!b.expirationDate) return -1;
+    return a.expirationDate.localeCompare(b.expirationDate);
+  });
+  let remaining = qty, totalCost = 0, consumed = 0;
+  for (const lot of sorted) {
+    if (remaining <= 0) break;
+    const take = Math.min(lot.remainingPieces, remaining);
+    totalCost += take * (lot.costPerUnit || 0);
+    consumed += take;
+    remaining -= take;
+  }
+  return { unitCost: consumed > 0 ? totalCost / consumed : 0, totalCost, consumed };
+}
+
 /* Devuelve piezas al inventario teórico (por ejemplo, al cancelar una merma). */
 function restoreToLots(lots, productId, branchId, qty) {
   const current = theoreticalStock(lots, productId, branchId);
@@ -164,8 +187,7 @@ function getPeriodRange(period) {
    valor de mermas / valor de compras del periodo, comparado contra el %
    máximo. Devuelve también los productos y causas con mayor incidencia,
    igual que pide la especificación para el detalle de la alerta. */
-function computeMermaStandardStatus(state, branchId, period) {
-  const { start, end } = getPeriodRange(period);
+function computeMermaStatusForRange(state, branchId, start, end) {
   const mermasInPeriod = state.mermas.filter((m) => m.branchId === branchId && m.status !== "cancelled" && m.date >= start && m.date <= end);
   const comprasInPeriod = state.invoices.filter((i) => i.branchId === branchId && i.status !== "cancelled" && i.entryDate >= start && i.entryDate <= end);
   const valorMermas = mermasInPeriod.reduce((s, m) => s + m.totalCost, 0);
@@ -188,6 +210,72 @@ function computeMermaStandardStatus(state, branchId, period) {
   const topCauses = Object.entries(byClass).sort((a, b) => b[1] - a[1]).map(([k, cost]) => ({ name: MERMA_CLASS[k] || k, cost }));
   const excedente = standard != null ? Math.max(0, valorMermas - (valorCompras * standard) / 100) : 0;
   return { branchId, branchName: branch?.name || "—", start, end, valorMermas, valorCompras, realPercent, standard, estado, excedente, topProducts, topCauses };
+}
+
+function computeMermaStandardStatus(state, branchId, period) {
+  const { start, end } = getPeriodRange(period);
+  return computeMermaStatusForRange(state, branchId, start, end);
+}
+
+/* Mismo tipo de rango que getPeriodRange, pero para el periodo INMEDIATO
+   ANTERIOR — se usa para comparar la evolución de cada sucursal contra el
+   periodo pasado. */
+function getPreviousPeriodRange(period) {
+  const now = new Date();
+  if (period === "diario") {
+    const d = new Date(now); d.setDate(d.getDate() - 1);
+    const s = d.toISOString().slice(0, 10); return { start: s, end: s };
+  }
+  if (period === "semanal") {
+    const d = new Date(now); const day = d.getDay(); const diff = day === 0 ? 6 : day - 1;
+    d.setDate(d.getDate() - diff - 7);
+    const start = d.toISOString().slice(0, 10);
+    const e = new Date(d); e.setDate(e.getDate() + 6);
+    return { start, end: e.toISOString().slice(0, 10) };
+  }
+  if (period === "trimestral") {
+    const q = Math.floor(now.getMonth() / 3);
+    const start = new Date(now.getFullYear(), (q - 1) * 3, 1);
+    const end = new Date(now.getFullYear(), q * 3, 0);
+    return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+  }
+  const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const end = new Date(now.getFullYear(), now.getMonth(), 0);
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+}
+
+/* Agrega los datos de mermas (filtrados) para el panel de análisis: totales,
+   desgloses por sucursal/producto/categoría, y evolución mensual. */
+function computeMermaAnalytics(state, filters) {
+  const mermas = state.mermas.filter((m) => m.status !== "cancelled")
+    .filter((m) => !filters.dateFrom || m.date >= filters.dateFrom)
+    .filter((m) => !filters.dateTo || m.date <= filters.dateTo)
+    .filter((m) => !filters.branchId || m.branchId === filters.branchId)
+    .filter((m) => !filters.productId || m.productId === filters.productId)
+    .filter((m) => !filters.classification || m.classification === filters.classification)
+    .filter((m) => !filters.search || m.reason.toLowerCase().includes(filters.search.toLowerCase()));
+
+  const totalCost = mermas.reduce((s, m) => s + m.totalCost, 0);
+
+  const byBranch = {};
+  mermas.forEach((m) => { byBranch[m.branchId] = (byBranch[m.branchId] || 0) + m.totalCost; });
+  const porSucursal = state.branches.map((b) => ({ sucursal: b.name, costo: byBranch[b.id] || 0 })).filter((r) => r.costo > 0 || !filters.branchId);
+
+  const byProduct = {};
+  mermas.forEach((m) => { byProduct[m.productId] = (byProduct[m.productId] || 0) + m.totalCost; });
+  const porProducto = Object.entries(byProduct).sort((a, b) => b[1] - a[1]).slice(0, 8)
+    .map(([pid, cost]) => ({ producto: state.products.find((p) => p.id === pid)?.name || "—", costo: cost }));
+
+  const byClass = {};
+  mermas.forEach((m) => { byClass[m.classification] = (byClass[m.classification] || 0) + m.totalCost; });
+  const porCategoria = Object.entries(byClass).map(([k, cost]) => ({ name: MERMA_CLASS[k] || k, value: cost }));
+
+  const byMonth = {};
+  mermas.forEach((m) => { const key = m.date.slice(0, 7); byMonth[key] = (byMonth[key] || 0) + m.totalCost; });
+  const evolucion = Object.entries(byMonth).sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([mes, costo]) => ({ mes: fmtDate(mes + "-01").replace(/ de \d+$/, ""), costo }));
+
+  return { mermas, totalCost, totalCount: mermas.length, porSucursal, porProducto, porCategoria, evolucion };
 }
 
 const MERMA_ESTADO_META = {
@@ -1422,32 +1510,28 @@ function MermaForm({ state, branches, forcedBranchId, onSave, onClose }) {
   const products = state.products.filter((p) => p.status === "active");
   const [f, setF] = useState({
     productId: products[0]?.id || "", branchId: forcedBranchId || branches[0]?.id || "",
-    date: todayISO(), quantity: 0, unit: "Piezas", unitCost: 0,
+    date: todayISO(), quantity: 0, unit: "Piezas",
     classification: "caducidad", reason: "", observations: "", photoEvidence: null,
   });
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
-
-  const onProductChange = (productId) => {
-    const prod = state.products.find((p) => p.id === productId);
-    const suggestedCost = prod && prod.lastCostPerPackage != null && prod.piecesPerPackage
-      ? +(prod.lastCostPerPackage / prod.piecesPerPackage).toFixed(2) : f.unitCost;
-    setF((s) => ({ ...s, productId, unitCost: suggestedCost }));
-  };
 
   const onPhoto = (e) => {
     const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader(); reader.onload = () => set("photoEvidence", reader.result); reader.readAsDataURL(file);
   };
 
-  const totalCost = clampNum(f.quantity) * clampNum(f.unitCost);
-  const valid = f.productId && f.branchId && clampNum(f.quantity) > 0 && f.classification && f.reason.trim();
+  const qty = clampNum(f.quantity);
+  const availableStock = theoreticalStock(state.lots, f.productId, f.branchId);
+  const costCalc = computeFEFOCost(state.lots, f.productId, f.branchId, qty);
+  const exceedsStock = qty > availableStock;
+  const valid = f.productId && f.branchId && qty > 0 && f.classification && f.reason.trim() && availableStock > 0;
 
   return (
     <Modal title="Registrar merma" onClose={onClose} width={620}>
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ display: "grid", gridTemplateColumns: forcedBranchId ? "1fr 1fr" : "1fr 1fr 1fr", gap: 10 }}>
           <Field label="Producto">
-            <Select value={f.productId} onChange={(e) => onProductChange(e.target.value)}>
+            <Select value={f.productId} onChange={(e) => set("productId", e.target.value)}>
               {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             </Select>
           </Field>
@@ -1461,15 +1545,23 @@ function MermaForm({ state, branches, forcedBranchId, onSave, onClose }) {
           <Field label="Fecha"><TextInput type="date" value={f.date} onChange={(e) => set("date", e.target.value)} /></Field>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-          <Field label="Cantidad"><TextInput type="number" min="0" value={f.quantity} onChange={(e) => set("quantity", clampNum(e.target.value))} /></Field>
+          <Field label="Cantidad" hint={`Disponible en inventario: ${availableStock}`}>
+            <TextInput type="number" min="0" value={f.quantity} onChange={(e) => set("quantity", clampNum(e.target.value))} />
+          </Field>
           <Field label="Unidad de medida">
             <Select value={f.unit} onChange={(e) => set("unit", e.target.value)}>
               {MERMA_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
             </Select>
           </Field>
-          <Field label="Costo unitario"><TextInput type="number" min="0" step="0.01" value={f.unitCost} onChange={(e) => set("unitCost", clampNum(e.target.value))} /></Field>
+          <Field label="Costo unitario" hint="Calculado del inventario, no editable">
+            <div style={{ ...inputStyle, background: T.cream, color: T.gray500, display: "flex", alignItems: "center" }}>{fmtMoney(costCalc.unitCost)}</div>
+          </Field>
         </div>
-        <div style={{ textAlign: "right", fontSize: 13, color: T.gray500 }}>Costo total de la merma: <b style={{ color: T.ink }}>{fmtMoney(totalCost)}</b></div>
+        {exceedsStock && availableStock > 0 && (
+          <div style={{ fontSize: 12, color: T.orange, fontWeight: 600 }}>Solo hay {availableStock} {f.unit} disponibles — se registrará la merma sobre esa cantidad, no sobre {qty}.</div>
+        )}
+        {availableStock <= 0 && <div style={{ fontSize: 12, color: T.red, fontWeight: 600 }}>Este producto no tiene existencia en esta sucursal — no se puede registrar una merma.</div>}
+        <div style={{ textAlign: "right", fontSize: 13, color: T.gray500 }}>Costo total de la merma: <b style={{ color: T.ink }}>{fmtMoney(costCalc.totalCost)}</b></div>
         <Field label="Clasificación">
           <Select value={f.classification} onChange={(e) => set("classification", e.target.value)}>
             {Object.entries(MERMA_CLASS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
@@ -1485,7 +1577,7 @@ function MermaForm({ state, branches, forcedBranchId, onSave, onClose }) {
         </Field>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 6 }}>
           <Btn variant="ghost" onClick={onClose}>Cancelar</Btn>
-          <Btn disabled={!valid} icon={CheckCircle2} onClick={() => onSave({ ...f, quantity: clampNum(f.quantity), unitCost: clampNum(f.unitCost), totalCost })}>Guardar merma</Btn>
+          <Btn disabled={!valid} icon={CheckCircle2} onClick={() => onSave({ ...f, quantity: qty })}>Guardar merma</Btn>
         </div>
       </div>
     </Modal>
@@ -1537,9 +1629,141 @@ function MermaStandardCard({ status }) {
   );
 }
 
+const MERMA_PIE_COLORS = [T.expired, T.orange, T.green700];
+
+function MermasAnalyticsPanel({ state, isGeneral, branchId }) {
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [fBranch, setFBranch] = useState(branchId || "all");
+  const [fProduct, setFProduct] = useState("all");
+  const [fClass, setFClass] = useState("all");
+  const [fSearch, setFSearch] = useState("");
+
+  const filters = {
+    dateFrom: dateFrom || null, dateTo: dateTo || null,
+    branchId: fBranch === "all" ? null : fBranch,
+    productId: fProduct === "all" ? null : fProduct,
+    classification: fClass === "all" ? null : fClass,
+    search: fSearch || null,
+  };
+  const data = computeMermaAnalytics(state, filters);
+
+  const period = state.config.mermaPeriod || "mensual";
+  const rankBranches = isGeneral ? state.branches : state.branches.filter((b) => b.id === branchId);
+  const ranking = rankBranches.map((b) => {
+    const cur = computeMermaStandardStatus(state, b.id, period);
+    const prevRange = getPreviousPeriodRange(period);
+    const prev = computeMermaStatusForRange(state, b.id, prevRange.start, prevRange.end);
+    return { ...cur, prevPercent: prev.realPercent };
+  }).sort((a, b) => b.realPercent - a.realPercent);
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <Field label="Desde"><TextInput type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></Field>
+          <Field label="Hasta"><TextInput type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></Field>
+          {isGeneral && (
+            <Field label="Sucursal">
+              <Select value={fBranch} onChange={(e) => setFBranch(e.target.value)}>
+                <option value="all">Todas</option>
+                {state.branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </Select>
+            </Field>
+          )}
+          <Field label="Producto">
+            <Select value={fProduct} onChange={(e) => setFProduct(e.target.value)}>
+              <option value="all">Todos</option>
+              {state.products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </Select>
+          </Field>
+          <Field label="Clasificación">
+            <Select value={fClass} onChange={(e) => setFClass(e.target.value)}>
+              <option value="all">Todas</option>
+              {Object.entries(MERMA_CLASS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            </Select>
+          </Field>
+          <Field label="Buscar en motivo"><TextInput value={fSearch} onChange={(e) => setFSearch(e.target.value)} placeholder="Ej. refrigerador" /></Field>
+        </div>
+      </Card>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 14 }}>
+        <KpiCard label="Merma total (registros)" value={data.totalCount} accent={T.gray500} />
+        <KpiCard label="Costo total de mermas" value={fmtMoney(data.totalCost)} accent={T.red} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 14, marginBottom: 14 }}>
+        <Card>
+          <h4 style={{ margin: "0 0 10px", fontFamily: "'Space Grotesk',sans-serif" }}>Evolución de mermas por periodo</h4>
+          {data.evolucion.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={data.evolucion}><CartesianGrid strokeDasharray="3 3" stroke={T.border} /><XAxis dataKey="mes" tick={{ fontSize: 10 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip formatter={(v) => fmtMoney(v)} /><Line type="monotone" dataKey="costo" stroke={T.red} strokeWidth={2.5} dot={{ r: 3 }} /></LineChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="No hay mermas en este filtro para graficar." />}
+        </Card>
+        <Card>
+          <h4 style={{ margin: "0 0 10px", fontFamily: "'Space Grotesk',sans-serif" }}>Merma por categoría</h4>
+          {data.porCategoria.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <PieChart><Pie data={data.porCategoria} dataKey="value" nameKey="name" innerRadius={45} outerRadius={80}>{data.porCategoria.map((d, i) => <Cell key={i} fill={MERMA_PIE_COLORS[i % MERMA_PIE_COLORS.length]} />)}</Pie><Tooltip formatter={(v) => fmtMoney(v)} /><Legend wrapperStyle={{ fontSize: 11 }} /></PieChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="Sin datos." />}
+        </Card>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+        <Card>
+          <h4 style={{ margin: "0 0 10px", fontFamily: "'Space Grotesk',sans-serif" }}>Merma por sucursal</h4>
+          {data.porSucursal.some((r) => r.costo > 0) ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={data.porSucursal}><CartesianGrid strokeDasharray="3 3" stroke={T.border} /><XAxis dataKey="sucursal" tick={{ fontSize: 10 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip formatter={(v) => fmtMoney(v)} /><Bar dataKey="costo" fill={T.red} radius={[6, 6, 0, 0]} /></BarChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="Sin datos." />}
+        </Card>
+        <Card>
+          <h4 style={{ margin: "0 0 10px", fontFamily: "'Space Grotesk',sans-serif" }}>Productos con mayor pérdida económica</h4>
+          {data.porProducto.length ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={data.porProducto} layout="vertical"><CartesianGrid strokeDasharray="3 3" stroke={T.border} /><XAxis type="number" tick={{ fontSize: 11 }} /><YAxis type="category" dataKey="producto" width={90} tick={{ fontSize: 10 }} /><Tooltip formatter={(v) => fmtMoney(v)} /><Bar dataKey="costo" fill={T.orange} radius={[0, 6, 6, 0]} /></BarChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="Sin datos." />}
+        </Card>
+      </div>
+
+      <Card style={{ padding: 0, overflow: "auto" }}>
+        <div style={{ padding: "14px 16px 0" }}>
+          <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>Ranking entre sucursales — periodo {MERMA_PERIODS[period]}</h4>
+          <div style={{ fontSize: 11.5, color: T.gray500 }}>Ordenado de mayor a menor % de merma real.</div>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+          <thead><tr><Th>Sucursal</Th><Th>% real</Th><Th>Estándar</Th><Th>Estado</Th><Th>Costo de mermas</Th><Th>Periodo anterior</Th><Th>Evolución</Th></tr></thead>
+          <tbody>
+            {ranking.map((r) => {
+              const delta = r.realPercent - r.prevPercent;
+              return (
+                <tr key={r.branchId}>
+                  <Td><b>{r.branchName}</b></Td>
+                  <Td>{r.realPercent.toFixed(1)}%</Td>
+                  <Td>{r.standard != null ? `${r.standard}%` : "—"}</Td>
+                  <Td><Pill bg={MERMA_ESTADO_META[r.estado].bg} fg={MERMA_ESTADO_META[r.estado].fg}>{MERMA_ESTADO_META[r.estado].label}</Pill></Td>
+                  <Td>{fmtMoney(r.valorMermas)}</Td>
+                  <Td>{r.prevPercent.toFixed(1)}%</Td>
+                  <Td><span style={{ color: delta > 0 ? T.red : delta < 0 ? T.green700 : T.gray500, fontWeight: 700 }}>{delta > 0 ? "▲" : delta < 0 ? "▼" : "—"} {Math.abs(delta).toFixed(1)} pp</span></Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {!ranking.length && <EmptyState text="No hay sucursales para comparar." />}
+      </Card>
+    </div>
+  );
+}
+
 function MermasView({ state, mutate, branches, activeBranchId, currentUser, audit }) {
   const isGeneral = currentUser.role === "general_admin";
   const branchId = isGeneral ? activeBranchId : currentUser.branchId;
+  const [tab, setTab] = useState("registro");
   const [showForm, setShowForm] = useState(false);
   const [classFilter, setClassFilter] = useState("all");
   const [cancelTarget, setCancelTarget] = useState(null);
@@ -1552,18 +1776,19 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
     .sort((a, b) => b.date.localeCompare(a.date));
 
   const createMerma = (f) => {
+    const costCalc = computeFEFOCost(state.lots, f.productId, f.branchId, f.quantity);
     mutate((s) => ({
       ...s,
       lots: deductFromLots(s.lots, f.productId, f.branchId, f.quantity),
       mermas: [...s.mermas, {
         id: uid("merma"), lotId: null, productId: f.productId, branchId: f.branchId,
-        date: f.date, quantity: f.quantity, unit: f.unit, unitCost: f.unitCost, totalCost: f.totalCost,
+        date: f.date, quantity: costCalc.consumed, unit: f.unit, unitCost: costCalc.unitCost, totalCost: costCalc.totalCost,
         classification: f.classification, reason: f.reason, observations: f.observations, photoEvidence: f.photoEvidence,
         responsible: currentUser.name, status: "active",
         createdBy: currentUser.name, createdAt: nowStamp(),
       }],
     }));
-    audit("Mermas", `Registró merma de ${f.quantity} ${f.unit} — ${state.products.find((p) => p.id === f.productId)?.name} (${MERMA_CLASS[f.classification]})`);
+    audit("Mermas", `Registró merma de ${costCalc.consumed} ${f.unit} — ${state.products.find((p) => p.id === f.productId)?.name} (${MERMA_CLASS[f.classification]})`);
     setShowForm(false);
   };
 
@@ -1591,6 +1816,13 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
 
   return (
     <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
+        {[["registro", "Registro"], ["analisis", "Panel de análisis"]].map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+        ))}
+      </div>
+      {tab === "analisis" && <MermasAnalyticsPanel state={state} isGeneral={isGeneral} branchId={branchId} />}
+      {tab === "registro" && (<>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <ExportBar rows={exportRows} label="mermas" />
@@ -1652,6 +1884,7 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
           <img src={evidenceView} alt="Evidencia de merma" style={{ width: "100%", borderRadius: 10 }} />
         </Modal>
       )}
+      </>)}
     </div>
   );
 }
