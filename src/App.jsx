@@ -104,6 +104,15 @@ function theoreticalStock(lots, productId, branchId) {
     .reduce((s, l) => s + l.remainingPieces, 0);
 }
 
+/* Costo unitario ponderado de la existencia actual de un producto/sucursal,
+   a partir del costo real de cada lote activo (no un valor capturado a mano). */
+function weightedUnitCost(lots, productId, branchId) {
+  const relevant = lots.filter((l) => l.productId === productId && l.branchId === branchId && l.status === "active");
+  const qty = relevant.reduce((s, l) => s + l.remainingPieces, 0);
+  const val = relevant.reduce((s, l) => s + l.remainingPieces * (l.costPerUnit || 0), 0);
+  return qty > 0 ? val / qty : 0;
+}
+
 function reconcileLotsForCount(lots, productId, branchId, newTotal) {
   const relevant = lots.filter((l) => l.productId === productId && l.branchId === branchId && l.status === "active");
   const others = lots.filter((l) => !(l.productId === productId && l.branchId === branchId && l.status === "active"));
@@ -374,6 +383,20 @@ function generateInventoryFolio(state, branchId) {
   const prefix = branch?.folioPrefix || (branch ? suggestFolioPrefix(branch.name) : "INV");
   const seq = state.physicalInventories.filter((pi) => pi.branchId === branchId).length + 1;
   return `${prefix}-${seq.toString().padStart(4, "0")}`;
+}
+
+/* Recalcula los folios de TODOS los inventarios de una sucursal según su
+   prefijo actual, respetando el orden en que se crearon — útil si el
+   prefijo cambió o si un inventario se creó antes de tener uno asignado. */
+function recalcBranchFolios(state, branchId) {
+  const branch = state.branches.find((b) => b.id === branchId);
+  const prefix = branch?.folioPrefix || suggestFolioPrefix(branch?.name || "");
+  const branchInvs = state.physicalInventories
+    .filter((pi) => pi.branchId === branchId)
+    .sort((a, b) => (a.createdAt?.date || a.date).localeCompare(b.createdAt?.date || b.date) || (a.createdAt?.time || "").localeCompare(b.createdAt?.time || ""));
+  const folioById = {};
+  branchInvs.forEach((pi, idx) => { folioById[pi.id] = `${prefix}-${(idx + 1).toString().padStart(4, "0")}`; });
+  return folioById;
 }
 
 function computeSuggestedOrders(state, branchId) {
@@ -963,7 +986,7 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
 
 /* ============================== PRODUCTOS ============================== */
 function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
-  const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", notes: "", image: null, idealStock: {} });
+  const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", category: "", notes: "", image: null, idealStock: {} });
   const [formError, setFormError] = useState("");
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const onImg = (e) => {
@@ -983,6 +1006,7 @@ function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
           <Field label="Piezas por paquete"><TextInput type="number" min="1" value={f.piecesPerPackage} onChange={(e) => set("piecesPerPackage", clampNum(e.target.value) || 1)} /></Field>
           <Field label="Código de producto"><TextInput value={f.code} onChange={(e) => set("code", e.target.value)} /></Field>
         </div>
+        <Field label="Categoría (opcional)"><TextInput value={f.category || ""} onChange={(e) => set("category", e.target.value)} placeholder="Ej. Bebidas, Lácteos, Abarrotes…" /></Field>
         <Field label="Proveedor">
           <Select value={f.supplierId} onChange={(e) => set("supplierId", e.target.value)}>
             {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -1157,6 +1181,8 @@ function SuppliersView({ state, mutate, audit }) {
 /* ============================== SUCURSALES ============================== */
 function BranchesView({ state, mutate, audit }) {
   const [form, setForm] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const save = (f) => {
     if (f.id) {
       const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : (state.branches.find((b) => b.id === f.id)?.folioPrefix || suggestFolioPrefix(f.name));
@@ -1170,6 +1196,22 @@ function BranchesView({ state, mutate, audit }) {
     setForm(null);
   };
   const toggle = (b) => { mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === b.id ? { ...x, status: x.status === "active" ? "disabled" : "active" } : x)) })); audit("Sucursales", `${b.status === "active" ? "Desactivó" : "Reactivó"} ${b.name}`); };
+  const doDelete = () => {
+    const bId = deleteTarget.id;
+    mutate((s) => ({
+      ...s,
+      branches: s.branches.filter((b) => b.id !== bId),
+      products: s.products.map((p) => (p.idealStock && bId in p.idealStock ? { ...p, idealStock: Object.fromEntries(Object.entries(p.idealStock).filter(([k]) => k !== bId)) } : p)),
+      invoices: s.invoices.filter((i) => i.branchId !== bId),
+      lots: s.lots.filter((l) => l.branchId !== bId),
+      mermas: s.mermas.filter((m) => m.branchId !== bId),
+      physicalInventories: s.physicalInventories.filter((pi) => pi.branchId !== bId),
+      inventoryAdjustments: (s.inventoryAdjustments || []).filter((a) => a.branchId !== bId),
+      users: s.users.map((u) => (u.branchId === bId ? { ...u, status: "disabled" } : u)),
+    }));
+    audit("Sucursales", `Eliminó permanentemente la sucursal ${deleteTarget.name} y todos sus registros asociados (facturas, inventarios, mermas, ajustes)`);
+    setDeleteTarget(null); setDeleteConfirmText("");
+  };
   const exportRows = state.branches.map((b) => ({ Número: b.number, Sucursal: b.name, Estado: b.status === "active" ? "Activa" : "Desactivada" }));
   return (
     <div>
@@ -1188,6 +1230,7 @@ function BranchesView({ state, mutate, audit }) {
             <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
               <Btn small variant="secondary" icon={Pencil} onClick={() => setForm(b)}>Editar</Btn>
               <Btn small variant="danger" icon={Ban} onClick={() => toggle(b)}>{b.status === "active" ? "Desactivar" : "Reactivar"}</Btn>
+              <Btn small variant="danger" icon={Trash2} onClick={() => setDeleteTarget(b)}>Eliminar</Btn>
             </div>
           </Card>
         ))}
@@ -1207,6 +1250,18 @@ function BranchesView({ state, mutate, audit }) {
               <Btn variant="ghost" onClick={() => setForm(null)}>Cancelar</Btn>
               <Btn onClick={() => form.name.trim() && save(form)}>Guardar</Btn>
             </div>
+          </div>
+        </Modal>
+      )}
+      {deleteTarget && (
+        <Modal title={`Eliminar "${deleteTarget.name}" permanentemente`} onClose={() => { setDeleteTarget(null); setDeleteConfirmText(""); }} width={420}>
+          <p style={{ fontSize: 13, color: T.red, fontWeight: 600, marginTop: 0 }}>Esta acción no se puede deshacer. Se eliminarán para siempre la sucursal y todos sus registros: facturas, inventarios físicos, ajustes, mermas y existencias. Los usuarios asignados a esta sucursal quedarán desactivados.</p>
+          <Field label={`Para confirmar, escribe el nombre exacto: ${deleteTarget.name}`}>
+            <TextInput value={deleteConfirmText} onChange={(e) => setDeleteConfirmText(e.target.value)} />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+            <Btn variant="ghost" onClick={() => { setDeleteTarget(null); setDeleteConfirmText(""); }}>Cancelar</Btn>
+            <Btn variant="danger" disabled={deleteConfirmText.trim() !== deleteTarget.name} icon={Trash2} onClick={doDelete}>Eliminar permanentemente</Btn>
           </div>
         </Modal>
       )}
@@ -1824,6 +1879,13 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
     setCancelTarget(null); setCancelReason("");
   };
 
+  const doRecalcFolios = () => {
+    if (!branchId) return;
+    const folioById = recalcBranchFolios(state, branchId);
+    mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (folioById[pi.id] ? { ...pi, folio: folioById[pi.id] } : pi)) }));
+    audit("Inventario físico", `Recalculó los folios de los inventarios de ${state.branches.find((b) => b.id === branchId)?.name}`);
+  };
+
   const exportRows = list.map((pi) => ({
     Folio: pi.folio, Fecha: fmtDate(pi.date), Tipo: INV_TYPES[pi.type] || "Inventario Físico",
     Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
@@ -1846,7 +1908,10 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
             <ExportBar rows={exportRows} label="inventarios físicos" />
             <TextInput placeholder="Buscar por folio…" value={folioSearch} onChange={(e) => setFolioSearch(e.target.value)} style={{ width: 180 }} />
           </div>
-          <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {isGeneral && branchId && <Btn small variant="secondary" icon={CheckCircle2} onClick={doRecalcFolios}>Recalcular folios de esta sucursal</Btn>}
+            <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
+          </div>
         </div>
         {!branchId && <div style={{ color: T.red, fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Selecciona una sucursal para crear un inventario.</div>}
       </Card>
@@ -2451,15 +2516,27 @@ function SuggestedOrdersView({ state, branches, activeBranchId, currentUser }) {
 const REPORT_TYPES = [
   "Existencias actuales", "Productos próximos a caducar", "Mermas por caducidad", "Facturas pendientes de pago",
   "Facturas pagadas", "Consumo por sucursal", "Compras por proveedor", "Comparativo de consumo entre sucursales",
-  "Historial de pedidos sugeridos",
+  "Historial de pedidos sugeridos", "Comparativo de inventario físico", "Impacto de inventario físico", "Histórico de inventarios físicos",
 ];
 function ReportsView({ state, branches }) {
   const [type, setType] = useState(REPORT_TYPES[0]);
   const [branchFilter, setBranchFilter] = useState("all");
 
   let rows = [];
+  let summary = null;
   if (type === "Existencias actuales") {
-    rows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ Producto: p.name, Sucursal: b.name, "Existencia (pz)": theoreticalStock(state.lots, p.id, b.id) })));
+    rows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => {
+      const existencia = theoreticalStock(state.lots, p.id, b.id);
+      const costoUnitario = weightedUnitCost(state.lots, p.id, b.id);
+      return { Producto: p.name, Categoría: p.category || "—", Sucursal: b.name, "Existencia actual": existencia, "Unidad de medida": "Piezas", "Costo unitario": fmtMoney(costoUnitario), "Costo total": fmtMoney(existencia * costoUnitario) };
+    }));
+    const existRows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ qty: theoreticalStock(state.lots, p.id, b.id), cost: weightedUnitCost(state.lots, p.id, b.id) })));
+    summary = [
+      { label: "Productos activos", value: state.products.filter((p) => p.status === "active").length },
+      { label: "Valor total del inventario", value: fmtMoney(existRows.reduce((s, r) => s + r.qty * r.cost, 0)) },
+      { label: "Con existencia", value: existRows.filter((r) => r.qty > 0).length },
+      { label: "Sin existencia / crítica (≤5 pz)", value: existRows.filter((r) => r.qty <= 5).length },
+    ];
   } else if (type === "Productos próximos a caducar") {
     rows = state.lots.filter((l) => l.status === "active" && l.expirationDate && l.remainingPieces > 0 && (branchFilter === "all" || l.branchId === branchFilter) && ["yellow", "orange", "red"].includes(semaphoreLevel(l.expirationDate, state.config)))
       .map((l) => ({ Producto: state.products.find((p) => p.id === l.productId)?.name, Sucursal: state.branches.find((b) => b.id === l.branchId)?.name, Caducidad: fmtDate(l.expirationDate), Piezas: l.remainingPieces, Nivel: SEM_META[semaphoreLevel(l.expirationDate, state.config)].label }));
@@ -2474,6 +2551,35 @@ function ReportsView({ state, branches }) {
     rows = state.suppliers.map((s) => ({ Proveedor: s.name, "Total comprado": fmtMoney(state.invoices.filter((i) => i.supplierId === s.id && i.status !== "cancelled" && (branchFilter === "all" || i.branchId === branchFilter)).reduce((sum, i) => sum + i.total, 0)) }));
   } else if (type === "Historial de pedidos sugeridos") {
     rows = state.physicalInventories.filter((pi) => branchFilter === "all" || pi.branchId === branchFilter).flatMap((pi) => pi.suggestedOrder.map((o) => ({ Folio: pi.folio, Fecha: fmtDate(pi.date), Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name, Producto: o.productName, "Piezas sugeridas": o.neededPieces })));
+  } else if (type === "Comparativo de inventario físico") {
+    const invs = state.physicalInventories.filter((pi) => isInventoryFinal(pi) && (branchFilter === "all" || pi.branchId === branchFilter));
+    rows = invs.flatMap((pi) => (pi.counts || []).filter((c) => c.theoretical != null).map((c) => ({
+      Folio: pi.folio, Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—", Producto: state.products.find((p) => p.id === c.productId)?.name || "—",
+      "Existencia teórica": c.theoretical, "Existencia física": c.total, Diferencia: c.difference, "Costo unitario": fmtMoney(c.unitCost || 0), "Costo de la diferencia": fmtMoney(c.diffCost || 0), "% Variación": `${(c.diffPercent || 0).toFixed(1)}%`,
+    })));
+  } else if (type === "Impacto de inventario físico") {
+    const invs = state.physicalInventories.filter((pi) => isInventoryFinal(pi) && (branchFilter === "all" || pi.branchId === branchFilter) && pi.faltantes != null);
+    rows = invs.map((pi) => ({
+      Folio: pi.folio, Fecha: fmtDate(pi.date), Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
+      "Faltantes (pz)": pi.faltantes, "Sobrantes (pz)": pi.sobrantes, "Valor de faltantes": fmtMoney(pi.valorFaltantes), "Valor de sobrantes": fmtMoney(pi.valorSobrantes),
+      "Diferencia económica neta": fmtMoney(pi.impactoNeto), "Ajustes generados": (state.inventoryAdjustments || []).filter((a) => a.inventoryId === pi.id).length,
+    }));
+    summary = [
+      { label: "Inventarios con impacto", value: invs.length },
+      { label: "Valor de faltantes", value: fmtMoney(invs.reduce((s, pi) => s + (pi.valorFaltantes || 0), 0)) },
+      { label: "Valor de sobrantes", value: fmtMoney(invs.reduce((s, pi) => s + (pi.valorSobrantes || 0), 0)) },
+      { label: "Diferencia económica neta", value: fmtMoney(invs.reduce((s, pi) => s + (pi.impactoNeto || 0), 0)) },
+    ];
+  } else if (type === "Histórico de inventarios físicos") {
+    rows = state.physicalInventories.filter((pi) => branchFilter === "all" || pi.branchId === branchFilter)
+      .sort((a, b) => (b.createdAt?.date || b.date).localeCompare(a.createdAt?.date || a.date))
+      .map((pi) => ({
+        Folio: pi.folio, Fecha: fmtDate(pi.date), Tipo: INV_TYPES[pi.type] || "Inventario Físico", Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
+        Responsable: (pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", "), "Productos contados": (pi.counts || []).length,
+        Diferencias: (pi.counts || []).filter((c) => c.difference).length, "Impacto económico": pi.impactoNeto != null ? fmtMoney(pi.impactoNeto) : "—",
+        "Ajustes generados": (state.inventoryAdjustments || []).filter((a) => a.inventoryId === pi.id).length,
+        Estado: pi.status === "cancelado" ? "Cancelado" : isInventoryOpen(pi) ? "En proceso" : "Finalizado",
+      }));
   }
 
   return (
@@ -2485,6 +2591,11 @@ function ReportsView({ state, branches }) {
         </Select>
         <ExportBar rows={rows} label={type} />
       </div>
+      {summary && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 14 }}>
+          {summary.map((s, i) => <KpiCard key={i} label={s.label} value={s.value} accent={i % 2 === 0 ? T.green700 : T.orange} />)}
+        </div>
+      )}
       <Card style={{ padding: 0, overflow: "auto" }}>
         <div style={{ padding: "14px 16px 0" }}>
           <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>{type}</h4>
