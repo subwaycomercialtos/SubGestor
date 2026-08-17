@@ -39,6 +39,17 @@ const AREA_LABELS = { almacen: "Almacén", congelador: "Congelador", refrigerado
 const MERMA_CLASS = { caducidad: "Caducidad", mal_estado: "Mal estado", produccion: "Producción" };
 const MERMA_UNITS = ["Piezas", "Kg", "Litros", "Otro"];
 const MERMA_PERIODS = { diario: "Diario", semanal: "Semanal", mensual: "Mensual", trimestral: "Trimestral" };
+const INV_TYPES = { fisico: "Inventario Físico", existencia_inicial: "Existencia Inicial", auditoria: "Auditoría" };
+const INV_STATUS_META = {
+  en_proceso: { bg: "#FDF3D0", fg: "#D99E00", label: "En proceso" },
+  finalizado: { bg: "#E7F2E9", fg: "#1E5631", label: "Finalizado" },
+  cancelado: { bg: "#EEEFEB", fg: "#6B7568", label: "Cancelado" },
+};
+const DIFF_LEVEL_META = {
+  sin_diferencia: { bg: "#E7F2E9", fg: "#1E5631", label: "Sin diferencia", icon: "⚪" },
+  diferencia_menor: { bg: "#FDF3D0", fg: "#D99E00", label: "Diferencia menor", icon: "🟡" },
+  diferencia_significativa: { bg: "#FBDCDA", fg: "#D8453B", label: "Diferencia significativa", icon: "🔴" },
+};
 const MODULES = {
   dashboard: "Dashboard", productos: "Productos", proveedores: "Proveedores", sucursales: "Sucursales",
   usuarios: "Usuarios", facturas: "Facturas", inventario: "Inventario físico", alertas: "Alertas de caducidad",
@@ -294,7 +305,7 @@ function computeCrossAnalysis(state, branchId, start, end) {
       });
     });
     const estUnitCost = p.lastCostPerPackage != null ? p.lastCostPerPackage / p.piecesPerPackage : 0;
-    const relevantPI = state.physicalInventories.filter((pi) => pi.status === "active" && (!branchId || pi.branchId === branchId) && pi.date >= start && pi.date <= end);
+    const relevantPI = state.physicalInventories.filter((pi) => isInventoryFinal(pi) && (!branchId || pi.branchId === branchId) && pi.date >= start && pi.date <= end);
     let consumido = 0;
     relevantPI.forEach((pi) => {
       const c = pi.consumption.find((c) => c.productId === p.id);
@@ -314,6 +325,56 @@ const MERMA_ESTADO_META = {
   anomala: { bg: "#FBDCDA", fg: "#D8453B", label: "Merma anómala" },
   sin_estandar: { bg: "#EEEFEB", fg: "#6B7568", label: "Sin estándar definido" },
 };
+
+/* Los inventarios físicos creados antes de esta actualización usaban
+   status:"active" para "ya finalizado". Esta función reconoce ambos formatos
+   sin necesidad de migrar los datos existentes. */
+function isInventoryFinal(pi) {
+  return pi.status === "finalizado" || pi.status === "active";
+}
+function isInventoryOpen(pi) {
+  return pi.status === "en_proceso";
+}
+
+/* Clasifica una diferencia de inventario según el % de variación configurado
+   por el Administrador General (Sin diferencia / Diferencia menor / Diferencia
+   significativa). */
+function classifyDiff(diffPercent, toleranceLimit) {
+  if (diffPercent === 0) return "sin_diferencia";
+  if (Math.abs(diffPercent) <= (toleranceLimit ?? 5)) return "diferencia_menor";
+  return "diferencia_significativa";
+}
+
+/* Prefijo de folio sugerido a partir del nombre de la sucursal: inicial de
+   cada palabra (ej. "SWY SAN CRISTOBAL" -> "SSC"). Si el nombre es una sola
+   palabra, usa sus primeras 3 letras. */
+function suggestFolioPrefix(name) {
+  const words = (name || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length >= 2) return words.map((w) => w[0]).join("").toUpperCase().slice(0, 6);
+  return (words[0] || "SUC").slice(0, 3).toUpperCase();
+}
+
+/* Garantiza que el prefijo no choque con el de otra sucursal ya existente
+   (le agrega un número al final si hiciera falta: SSC, SSC2, SSC3...). */
+function uniqueFolioPrefix(name, branches, exceptId) {
+  const base = suggestFolioPrefix(name);
+  const taken = new Set(branches.filter((b) => b.id !== exceptId && b.folioPrefix).map((b) => b.folioPrefix));
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(base + n)) n++;
+  return base + n;
+}
+
+/* Folio único por sucursal: cada sucursal lleva su propia numeración
+   (PREFIJO-secuencial), usando el prefijo guardado de la sucursal — así
+   nunca se repite entre sucursales y cada una tiene su propio conteo desde
+   0001. */
+function generateInventoryFolio(state, branchId) {
+  const branch = state.branches.find((b) => b.id === branchId);
+  const prefix = branch?.folioPrefix || (branch ? suggestFolioPrefix(branch.name) : "INV");
+  const seq = state.physicalInventories.filter((pi) => pi.branchId === branchId).length + 1;
+  return `${prefix}-${seq.toString().padStart(4, "0")}`;
+}
 
 function computeSuggestedOrders(state, branchId) {
   return state.products
@@ -350,7 +411,7 @@ function seedState() {
     costPerUnit: 0, status: "active", source: "inicial",
   }));
   return {
-    branches: [{ id: branchId, number: 1, name: "Sucursal Centro", status: "active", mermaStandardPercent: 3 }],
+    branches: [{ id: branchId, number: 1, name: "Sucursal Centro", status: "active", mermaStandardPercent: 3, folioPrefix: "SC" }],
     suppliers: [{ id: supplierId, name: "PROPIMEX", productTypes: "Bebidas", paymentDueDays: 30, status: "active" }],
     products, lots,
     invoices: [], mermas: [], physicalInventories: [],
@@ -359,7 +420,7 @@ function seedState() {
       { id: uid("usr"), username: "100", password: "1234", role: "branch_admin", name: "Encargado Sucursal Centro", branchId, status: "active", failedAttempts: 0, lockedUntil: null, lastLogin: null },
     ],
     auditLog: [],
-    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual", mermaApprovalThreshold: null },
+    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual", mermaApprovalThreshold: null, inventoryToleranceLimit: 5 },
   };
 }
 
@@ -801,7 +862,7 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
     : [];
 
   const consumptionByBranch = state.branches.map((b) => {
-    const total = state.physicalInventories.filter((pi) => pi.branchId === b.id && pi.status === "active")
+    const total = state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi))
       .flatMap((pi) => pi.consumption).reduce((s, c) => s + c.consumedPieces, 0);
     return { sucursal: b.name, consumo: total };
   });
@@ -820,7 +881,7 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
     compras: state.invoices.filter((i) => i.supplierId === s.id && i.status !== "cancelled" && branchIds.includes(i.branchId)).reduce((sum, i) => sum + i.total, 0),
   }));
 
-  const trend = [...state.physicalInventories].filter((pi) => pi.status === "active" && branchIds.includes(pi.branchId))
+  const trend = [...state.physicalInventories].filter((pi) => isInventoryFinal(pi) && branchIds.includes(pi.branchId))
     .sort((a, b) => a.date.localeCompare(b.date))
     .map((pi) => ({ fecha: fmtDate(pi.date), consumo: pi.consumption.reduce((s, c) => s + c.consumedPieces, 0) }));
 
@@ -1097,8 +1158,15 @@ function SuppliersView({ state, mutate, audit }) {
 function BranchesView({ state, mutate, audit }) {
   const [form, setForm] = useState(null);
   const save = (f) => {
-    if (f.id) { mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === f.id ? f : x)) })); audit("Sucursales", `Editó sucursal ${f.name}`); }
-    else { mutate((s) => ({ ...s, branches: [...s.branches, { ...f, id: uid("suc"), status: "active" }] })); audit("Sucursales", `Dio de alta la sucursal ${f.name}`); }
+    if (f.id) {
+      const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : (state.branches.find((b) => b.id === f.id)?.folioPrefix || suggestFolioPrefix(f.name));
+      mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === f.id ? { ...f, folioPrefix } : x)) }));
+      audit("Sucursales", `Editó sucursal ${f.name}`);
+    } else {
+      const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : uniqueFolioPrefix(f.name, state.branches);
+      mutate((s) => ({ ...s, branches: [...s.branches, { ...f, folioPrefix, id: uid("suc"), status: "active" }] }));
+      audit("Sucursales", `Dio de alta la sucursal ${f.name}`);
+    }
     setForm(null);
   };
   const toggle = (b) => { mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === b.id ? { ...x, status: x.status === "active" ? "disabled" : "active" } : x)) })); audit("Sucursales", `${b.status === "active" ? "Desactivó" : "Reactivó"} ${b.name}`); };
@@ -1113,7 +1181,7 @@ function BranchesView({ state, mutate, audit }) {
         {state.branches.map((b) => (
           <Card key={b.id}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div><div style={{ fontSize: 11, color: T.gray500, fontWeight: 700 }}>SUCURSAL #{b.number}</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 17, fontWeight: 700 }}>{b.name}</div></div>
+              <div><div style={{ fontSize: 11, color: T.gray500, fontWeight: 700 }}>SUCURSAL #{b.number} · {b.folioPrefix || suggestFolioPrefix(b.name)}</div><div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 17, fontWeight: 700 }}>{b.name}</div></div>
               <StatusPill status={b.status} />
             </div>
             <div style={{ fontSize: 12, color: T.gray500, marginTop: 8 }}>Estándar de merma: <b style={{ color: T.ink }}>{b.mermaStandardPercent != null ? `${b.mermaStandardPercent}%` : "No configurado"}</b></div>
@@ -1129,6 +1197,9 @@ function BranchesView({ state, mutate, audit }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <Field label="Número de sucursal"><TextInput type="number" value={form.number} onChange={(e) => setForm({ ...form, number: clampNum(e.target.value) })} /></Field>
             <Field label="Nombre de la sucursal"><TextInput value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
+            <Field label="Prefijo de folio" hint={`Se usa para los folios de inventario (ej. ${suggestFolioPrefix(form.name || "Sucursal")}-0001). Déjalo vacío para que se genere solo a partir del nombre.`}>
+              <TextInput value={form.folioPrefix || ""} onChange={(e) => setForm({ ...form, folioPrefix: e.target.value.toUpperCase() })} placeholder={form.id ? (form.folioPrefix || suggestFolioPrefix(form.name)) : suggestFolioPrefix(form.name || "")} />
+            </Field>
             <Field label="Estándar máximo de merma (%)" hint="Porcentaje del valor de compras del periodo. Déjalo vacío si aún no quieres definirlo.">
               <TextInput type="number" min="0" step="0.1" value={form.mermaStandardPercent ?? ""} onChange={(e) => setForm({ ...form, mermaStandardPercent: e.target.value === "" ? null : clampNum(e.target.value) })} />
             </Field>
@@ -1412,86 +1483,304 @@ function InvoicesView({ state, mutate, branches, activeBranchId, currentUser, au
 }
 
 /* ============================== INVENTARIO FÍSICO ============================== */
-function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, audit }) {
-  const branchId = currentUser.role === "branch_admin" ? currentUser.branchId : activeBranchId;
+/* ============================== INVENTARIO FÍSICO ============================== */
+function InventoryCreateModal({ state, branchId, currentUser, onCreate, onClose }) {
   const branchProducts = state.products.filter((p) => p.status === "active");
-  const [counts, setCounts] = useState({});
-  const [result, setResult] = useState(null);
+  const [type, setType] = useState("fisico");
+  const [date, setDate] = useState(todayISO());
+  const [selectedProducts, setSelectedProducts] = useState(branchProducts.map((p) => p.id));
+  const branchUsers = state.users.filter((u) => u.status === "active" && (u.role === "general_admin" || u.branchId === branchId));
+  const [selectedUsers, setSelectedUsers] = useState([currentUser.id]);
+
+  const toggleProduct = (id) => setSelectedProducts((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const toggleAllProducts = () => setSelectedProducts((s) => (s.length === branchProducts.length ? [] : branchProducts.map((p) => p.id)));
+  const toggleUser = (id) => setSelectedUsers((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const valid = selectedProducts.length > 0 && selectedUsers.length > 0 && date;
+
+  return (
+    <Modal title="Nuevo inventario físico" onClose={onClose} width={620}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <Field label="Fecha"><TextInput type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          <Field label="Tipo de inventario">
+            <Select value={type} onChange={(e) => setType(e.target.value)}>
+              {Object.entries(INV_TYPES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            </Select>
+          </Field>
+        </div>
+        <Field label={`Productos a contar (${selectedProducts.length} de ${branchProducts.length})`}>
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, maxHeight: 190, overflow: "auto", padding: 8 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 700, marginBottom: 6, cursor: "pointer", borderBottom: `1px solid ${T.border}`, paddingBottom: 6 }}>
+              <input type="checkbox" checked={selectedProducts.length === branchProducts.length} onChange={toggleAllProducts} /> Seleccionar todos
+            </label>
+            {branchProducts.map((p) => (
+              <label key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, padding: "3px 0", cursor: "pointer" }}>
+                <input type="checkbox" checked={selectedProducts.includes(p.id)} onChange={() => toggleProduct(p.id)} /> {p.name}
+              </label>
+            ))}
+          </div>
+        </Field>
+        <Field label="Usuario(s) responsables del conteo">
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, padding: 8 }}>
+            {branchUsers.map((u) => (
+              <label key={u.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, padding: "3px 0", cursor: "pointer" }}>
+                <input type="checkbox" checked={selectedUsers.includes(u.id)} onChange={() => toggleUser(u.id)} /> {u.name}
+              </label>
+            ))}
+          </div>
+        </Field>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <Btn variant="ghost" onClick={onClose}>Cancelar</Btn>
+          <Btn disabled={!valid} icon={CheckCircle2} onClick={() => onCreate({ type, date, productIds: selectedProducts, responsibles: branchUsers.filter((u) => selectedUsers.includes(u.id)).map((u) => u.name) })}>Crear inventario</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function DiffPill({ level }) {
+  const m = DIFF_LEVEL_META[level];
+  return <Pill bg={m.bg} fg={m.fg}>{m.icon} {m.label}</Pill>;
+}
+function InvStatusPill({ pi }) {
+  const key = isInventoryOpen(pi) ? "en_proceso" : pi.status === "cancelado" ? "cancelado" : "finalizado";
+  const m = INV_STATUS_META[key];
+  return <Pill bg={m.bg} fg={m.fg}>{m.label}</Pill>;
+}
+
+function InventoryCaptureView({ state, mutate, inventory, currentUser, audit, onClose }) {
+  const [counts, setCounts] = useState(() => {
+    const init = {};
+    inventory.counts.forEach((c) => { init[c.productId] = { almacen: c.almacen || 0, congelador: c.congelador || 0, refrigerador: c.refrigerador || 0, barra: c.barra || 0 }; });
+    return init;
+  });
+  const products = state.products.filter((p) => inventory.productIds.includes(p.id));
+  const tolerance = state.config.inventoryToleranceLimit ?? 5;
 
   const setCount = (productId, area, val) => setCounts((c) => ({ ...c, [productId]: { ...c[productId], [area]: clampNum(val) } }));
   const totalFor = (productId) => AREAS.reduce((s, a) => s + ((counts[productId]?.[a]) || 0), 0);
+  const buildCountsArray = () => products.map((p) => ({ productId: p.id, ...AREAS.reduce((o, a) => ({ ...o, [a]: counts[p.id]?.[a] || 0 }), {}), total: totalFor(p.id) }));
 
-  const finalize = () => {
-    if (!branchId) return;
-    const consumption = []; let lotsNext = state.lots;
-    branchProducts.forEach((p) => {
-      const before = theoreticalStock(lotsNext, p.id, branchId);
-      const captured = totalFor(p.id);
-      const consumed = Math.max(0, before - captured);
-      consumption.push({ productId: p.id, consumedPieces: consumed, before, captured });
-      lotsNext = reconcileLotsForCount(lotsNext, p.id, branchId, captured);
-    });
-    const suggested = computeSuggestedOrders({ ...state, lots: lotsNext }, branchId);
-    const record = {
-      id: uid("pinv"), folio: `INV-${(state.physicalInventories.length + 1).toString().padStart(4, "0")}`,
-      branchId, date: todayISO(), registeredBy: currentUser.name,
-      counts: branchProducts.map((p) => ({ productId: p.id, ...AREAS.reduce((o, a) => ({ ...o, [a]: counts[p.id]?.[a] || 0 }), {}), total: totalFor(p.id) })),
-      consumption, suggestedOrder: suggested, status: "active",
-    };
-    mutate((s) => ({ ...s, lots: lotsNext, physicalInventories: [...s.physicalInventories, record] }));
-    audit("Inventario físico", `Finalizó inventario físico ${record.folio}`);
-    setResult(record); setCounts({});
+  const saveDraft = () => {
+    mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (pi.id === inventory.id ? { ...pi, counts: buildCountsArray() } : pi)) }));
+    audit("Inventario físico", `Guardó avance del inventario ${inventory.folio}`);
   };
 
-  const exportRows = state.physicalInventories
-    .filter((pi) => !branchId || pi.branchId === branchId)
-    .map((pi) => ({
-      Folio: pi.folio, Fecha: fmtDate(pi.date), Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
-      "Registrado por": pi.registeredBy, "Total piezas capturadas": pi.counts.reduce((s, c) => s + c.total, 0),
-      "Consumo total (pz)": pi.consumption.reduce((s, c) => s + c.consumedPieces, 0), Estado: pi.status === "active" ? "Activo" : "Cancelado",
+  const finalize = () => {
+    const consumption = []; let lotsNext = state.lots;
+    let faltantes = 0, sobrantes = 0, valorFaltantes = 0, valorSobrantes = 0;
+    const enrichedCounts = [];
+    products.forEach((p) => {
+      const theoretical = theoreticalStock(lotsNext, p.id, inventory.branchId);
+      const captured = totalFor(p.id);
+      const consumed = Math.max(0, theoretical - captured);
+      consumption.push({ productId: p.id, consumedPieces: consumed, before: theoretical, captured });
+      const diff = captured - theoretical;
+      const diffPercent = theoretical > 0 ? (diff / theoretical) * 100 : (diff !== 0 ? 100 : 0);
+      const relevantLots = lotsNext.filter((l) => l.productId === p.id && l.branchId === inventory.branchId && l.status === "active");
+      const lotsQty = relevantLots.reduce((s, l) => s + l.remainingPieces, 0);
+      const lotsVal = relevantLots.reduce((s, l) => s + l.remainingPieces * (l.costPerUnit || 0), 0);
+      const unitCost = lotsQty > 0 ? lotsVal / lotsQty : 0;
+      const diffCost = diff * unitCost;
+      if (diff < 0) { faltantes += Math.abs(diff); valorFaltantes += Math.abs(diffCost); }
+      if (diff > 0) { sobrantes += diff; valorSobrantes += diffCost; }
+      enrichedCounts.push({ productId: p.id, ...AREAS.reduce((o, a) => ({ ...o, [a]: counts[p.id]?.[a] || 0 }), {}), total: captured, theoretical, difference: diff, diffPercent, diffCost, diffLevel: classifyDiff(diffPercent, tolerance), unitCost });
+      lotsNext = reconcileLotsForCount(lotsNext, p.id, inventory.branchId, captured);
+    });
+    const suggested = computeSuggestedOrders({ ...state, lots: lotsNext }, inventory.branchId);
+    mutate((s) => ({
+      ...s, lots: lotsNext,
+      physicalInventories: s.physicalInventories.map((pi) => (pi.id === inventory.id ? {
+        ...pi, counts: enrichedCounts, consumption, suggestedOrder: suggested,
+        status: "finalizado", closedAt: nowStamp(),
+        faltantes, sobrantes, valorFaltantes, valorSobrantes, impactoNeto: valorSobrantes - valorFaltantes,
+        toleranceLimit: tolerance,
+      } : pi)),
     }));
+    audit("Inventario físico", `Finalizó el inventario ${inventory.folio}`);
+  };
 
   return (
     <div>
       <Card style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-          <div style={{ fontSize: 13, color: T.gray500 }}>Captura las existencias reales por área. El sistema calculará el consumo y generará la sugerencia de pedido al finalizar.</div>
-          <ExportBar rows={exportRows} label="historial de inventarios físicos" />
+          <div>
+            <div style={{ fontSize: 11, color: T.gray500, fontWeight: 700 }}>{inventory.folio} · {INV_TYPES[inventory.type] || "Inventario Físico"}</div>
+            <div style={{ fontSize: 13, color: T.gray500 }}>Responsable(s): {(inventory.responsibles || []).join(", ") || "—"} · {fmtDate(inventory.date)}</div>
+          </div>
+          <Btn variant="ghost" onClick={onClose}>← Volver a la lista</Btn>
         </div>
-        {!branchId && <div style={{ color: T.red, fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Selecciona una sucursal para capturar el inventario.</div>}
       </Card>
       <Card style={{ padding: 0, overflow: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr><Th>Producto</Th>{AREAS.map((a) => <Th key={a}>{AREA_LABELS[a]}</Th>)}<Th>Total piezas</Th><Th>Existencia teórica</Th></tr></thead>
+          <thead><tr><Th>Producto</Th>{AREAS.map((a) => <Th key={a}>{AREA_LABELS[a]}</Th>)}<Th>Total</Th><Th>Existencia según registros</Th><Th>Diferencia</Th></tr></thead>
           <tbody>
-            {branchProducts.map((p) => (
-              <tr key={p.id}>
-                <Td><b>{p.name}</b></Td>
-                {AREAS.map((a) => <Td key={a}><TextInput type="number" min="0" style={{ width: 70 }} value={counts[p.id]?.[a] || 0} onChange={(e) => setCount(p.id, a, e.target.value)} /></Td>)}
-                <Td><b>{totalFor(p.id)}</b></Td>
-                <Td>{branchId ? theoreticalStock(state.lots, p.id, branchId) : "—"}</Td>
+            {products.map((p) => {
+              const theoretical = theoreticalStock(state.lots, p.id, inventory.branchId);
+              const captured = totalFor(p.id);
+              const diff = captured - theoretical;
+              const diffPercent = theoretical > 0 ? (diff / theoretical) * 100 : (diff !== 0 ? 100 : 0);
+              return (
+                <tr key={p.id}>
+                  <Td><b>{p.name}</b></Td>
+                  {AREAS.map((a) => <Td key={a}><TextInput type="number" min="0" style={{ width: 70 }} value={counts[p.id]?.[a] || 0} onChange={(e) => setCount(p.id, a, e.target.value)} /></Td>)}
+                  <Td><b>{captured}</b></Td>
+                  <Td>{theoretical}</Td>
+                  <Td><div style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ color: diff < 0 ? T.red : diff > 0 ? T.orange : T.gray500, fontWeight: 700 }}>{diff > 0 ? "+" : ""}{diff}</span><DiffPill level={classifyDiff(diffPercent, tolerance)} /></div></Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Card>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+        <Btn variant="secondary" icon={CheckCircle2} onClick={saveDraft}>Guardar</Btn>
+        <Btn icon={CheckCircle2} onClick={finalize}>Finalizar inventario</Btn>
+      </div>
+    </div>
+  );
+}
+
+function InventoryDetailView({ state, inventory, onClose }) {
+  return (
+    <div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 11, color: T.gray500, fontWeight: 700 }}>{inventory.folio} · {INV_TYPES[inventory.type] || "Inventario Físico"}</div>
+            <div style={{ fontSize: 13, color: T.gray500 }}>Responsable(s): {(inventory.responsibles || [inventory.registeredBy]).filter(Boolean).join(", ") || "—"} · {fmtDate(inventory.date)}</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <InvStatusPill pi={inventory} />
+            <Btn variant="ghost" onClick={onClose}>← Volver a la lista</Btn>
+          </div>
+        </div>
+        {inventory.status === "cancelado" && inventory.cancelReason && <div style={{ fontSize: 12, color: T.gray500, marginTop: 8 }}>Motivo de cancelación: {inventory.cancelReason}</div>}
+      </Card>
+      {inventory.faltantes != null && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 14 }}>
+          <KpiCard label="Faltantes (pz)" value={inventory.faltantes} accent={T.red} />
+          <KpiCard label="Sobrantes (pz)" value={inventory.sobrantes} accent={T.orange} />
+          <KpiCard label="Valor de faltantes" value={fmtMoney(inventory.valorFaltantes)} accent={T.red} />
+          <KpiCard label="Impacto económico neto" value={fmtMoney(inventory.impactoNeto)} accent={inventory.impactoNeto < 0 ? T.red : T.green700} />
+        </div>
+      )}
+      <Card style={{ padding: 0, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><Th>Producto</Th><Th>Física</Th><Th>Teórica</Th><Th>Diferencia</Th><Th>% Variación</Th><Th>Costo de la diferencia</Th><Th>Estado</Th></tr></thead>
+          <tbody>
+            {inventory.counts.map((c) => (
+              <tr key={c.productId}>
+                <Td><b>{state.products.find((p) => p.id === c.productId)?.name || "—"}</b></Td>
+                <Td>{c.total}</Td>
+                <Td>{c.theoretical ?? "—"}</Td>
+                <Td>{c.difference != null ? (c.difference > 0 ? "+" : "") + c.difference : "—"}</Td>
+                <Td>{c.diffPercent != null ? `${c.diffPercent.toFixed(1)}%` : "—"}</Td>
+                <Td>{c.diffCost != null ? fmtMoney(c.diffCost) : "—"}</Td>
+                <Td>{c.diffLevel ? <DiffPill level={c.diffLevel} /> : "—"}</Td>
               </tr>
             ))}
           </tbody>
         </table>
       </Card>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
-        <Btn icon={CheckCircle2} disabled={!branchId} onClick={finalize}>Finalizar inventario físico</Btn>
-      </div>
-      {result && (
-        <Modal title={`Inventario ${result.folio} finalizado`} onClose={() => setResult(null)} width={640}>
-          <h4 style={{ fontFamily: "'Space Grotesk',sans-serif" }}>Consumo calculado</h4>
-          <table style={{ width: "100%", fontSize: 12.5, marginBottom: 16 }}>
-            <thead><tr><Th>Producto</Th><Th>Consumo (pz)</Th></tr></thead>
-            <tbody>{result.consumption.filter((c) => c.consumedPieces > 0).map((c) => <tr key={c.productId}><Td>{state.products.find((p) => p.id === c.productId)?.name}</Td><Td>{c.consumedPieces}</Td></tr>)}</tbody>
-          </table>
-          <h4 style={{ fontFamily: "'Space Grotesk',sans-serif" }}>Pedido sugerido</h4>
-          {result.suggestedOrder.length ? (
-            <table style={{ width: "100%", fontSize: 12.5 }}>
-              <thead><tr><Th>Producto</Th><Th>Piezas</Th><Th>Paquetes</Th></tr></thead>
-              <tbody>{result.suggestedOrder.map((o) => <tr key={o.productId}><Td>{o.productName}</Td><Td>{o.neededPieces}</Td><Td>{o.neededPackages}</Td></tr>)}</tbody>
-            </table>
-          ) : <EmptyState text="No se requieren pedidos: el stock cubre el ideal." />}
+    </div>
+  );
+}
+
+function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, audit }) {
+  const branchId = currentUser.role === "branch_admin" ? currentUser.branchId : activeBranchId;
+  const isGeneral = currentUser.role === "general_admin";
+  const [showCreate, setShowCreate] = useState(false);
+  const [openId, setOpenId] = useState(null);
+  const [folioSearch, setFolioSearch] = useState("");
+  const [cancelTarget, setCancelTarget] = useState(null);
+  const [cancelReason, setCancelReason] = useState("");
+
+  const list = state.physicalInventories
+    .filter((pi) => !branchId || pi.branchId === branchId)
+    .filter((pi) => !folioSearch || pi.folio.toLowerCase().includes(folioSearch.toLowerCase()))
+    .sort((a, b) => (b.createdAt?.date || b.date).localeCompare(a.createdAt?.date || a.date));
+
+  const openInventory = state.physicalInventories.find((pi) => pi.id === openId);
+
+  const createInventory = (f) => {
+    const record = {
+      id: uid("pinv"), folio: generateInventoryFolio(state, branchId),
+      branchId, type: f.type, date: f.date, createdAt: nowStamp(), closedAt: null,
+      createdBy: currentUser.name, registeredBy: currentUser.name, responsibles: f.responsibles,
+      productIds: f.productIds,
+      counts: f.productIds.map((pid) => ({ productId: pid, almacen: 0, congelador: 0, refrigerador: 0, barra: 0, total: 0 })),
+      status: "en_proceso", consumption: [], suggestedOrder: [],
+    };
+    mutate((s) => ({ ...s, physicalInventories: [...s.physicalInventories, record] }));
+    audit("Inventario físico", `Creó el inventario ${record.folio} (${INV_TYPES[f.type]})`);
+    setShowCreate(false);
+    setOpenId(record.id);
+  };
+
+  const doCancel = () => {
+    mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (pi.id === cancelTarget.id ? { ...pi, status: "cancelado", cancelReason, cancelledBy: currentUser.name, cancelledAt: nowStamp() } : pi)) }));
+    audit("Inventario físico", `Canceló el inventario ${cancelTarget.folio} — motivo: ${cancelReason}`);
+    setCancelTarget(null); setCancelReason("");
+  };
+
+  const exportRows = list.map((pi) => ({
+    Folio: pi.folio, Fecha: fmtDate(pi.date), Tipo: INV_TYPES[pi.type] || "Inventario Físico",
+    Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
+    Responsable: (pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", "),
+    Estado: pi.status === "cancelado" ? "Cancelado" : isInventoryOpen(pi) ? "En proceso" : "Finalizado",
+    "Faltantes (pz)": pi.faltantes ?? "—", "Impacto neto": pi.impactoNeto != null ? fmtMoney(pi.impactoNeto) : "—",
+  }));
+
+  if (openInventory) {
+    return isInventoryOpen(openInventory)
+      ? <InventoryCaptureView state={state} mutate={mutate} inventory={openInventory} currentUser={currentUser} audit={audit} onClose={() => setOpenId(null)} />
+      : <InventoryDetailView state={state} inventory={openInventory} onClose={() => setOpenId(null)} />;
+  }
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <ExportBar rows={exportRows} label="inventarios físicos" />
+            <TextInput placeholder="Buscar por folio…" value={folioSearch} onChange={(e) => setFolioSearch(e.target.value)} style={{ width: 180 }} />
+          </div>
+          <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
+        </div>
+        {!branchId && <div style={{ color: T.red, fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Selecciona una sucursal para crear un inventario.</div>}
+      </Card>
+      <Card style={{ padding: 0, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><Th>Folio</Th><Th>Fecha</Th><Th>Tipo</Th><Th>Sucursal</Th><Th>Responsable(s)</Th><Th>Estado</Th><Th></Th></tr></thead>
+          <tbody>
+            {list.map((pi) => (
+              <tr key={pi.id}>
+                <Td mono>{pi.folio}</Td><Td>{fmtDate(pi.date)}</Td><Td>{INV_TYPES[pi.type] || "Inventario Físico"}</Td>
+                <Td>{state.branches.find((b) => b.id === pi.branchId)?.name || "—"}</Td>
+                <Td>{(pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", ") || "—"}</Td>
+                <Td><InvStatusPill pi={pi} /></Td>
+                <Td>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <Btn small variant="secondary" onClick={() => setOpenId(pi.id)}>{isInventoryOpen(pi) ? "Continuar" : "Ver detalle"}</Btn>
+                    {isGeneral && pi.status !== "cancelado" && <Btn small variant="danger" onClick={() => setCancelTarget(pi)}>Cancelar</Btn>}
+                  </div>
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!list.length && <EmptyState text="No hay inventarios físicos registrados." />}
+      </Card>
+      {showCreate && <InventoryCreateModal state={state} branchId={branchId} currentUser={currentUser} onCreate={createInventory} onClose={() => setShowCreate(false)} />}
+      {cancelTarget && (
+        <Modal title={`Cancelar inventario ${cancelTarget.folio}`} onClose={() => setCancelTarget(null)} width={400}>
+          <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>El inventario se conserva en el historial, solo cambia su estado.</p>
+          <Field label="Motivo de la cancelación"><TextArea rows={3} value={cancelReason} onChange={(e) => setCancelReason(e.target.value)} /></Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
+            <Btn variant="ghost" onClick={() => setCancelTarget(null)}>Volver</Btn>
+            <Btn variant="danger" disabled={!cancelReason.trim()} onClick={doCancel}>Confirmar cancelación</Btn>
+          </div>
         </Modal>
       )}
     </div>
@@ -2080,7 +2369,7 @@ function ReportsView({ state, branches }) {
     const st = type === "Facturas pagadas" ? "paid" : "pending";
     rows = state.invoices.filter((i) => i.status === st && (branchFilter === "all" || i.branchId === branchFilter)).map((i) => ({ Factura: i.invoiceNumber, Proveedor: state.suppliers.find((s) => s.id === i.supplierId)?.name, Sucursal: state.branches.find((b) => b.id === i.branchId)?.name, Ingreso: fmtDate(i.entryDate), Total: fmtMoney(i.total) }));
   } else if (type === "Consumo por sucursal" || type === "Comparativo de consumo entre sucursales") {
-    rows = state.branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ Sucursal: b.name, "Consumo total (pz)": state.physicalInventories.filter((pi) => pi.branchId === b.id && pi.status === "active").flatMap((pi) => pi.consumption).reduce((s, c) => s + c.consumedPieces, 0), "Inventarios realizados": state.physicalInventories.filter((pi) => pi.branchId === b.id && pi.status === "active").length }));
+    rows = state.branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ Sucursal: b.name, "Consumo total (pz)": state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).flatMap((pi) => pi.consumption).reduce((s, c) => s + c.consumedPieces, 0), "Inventarios realizados": state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).length }));
   } else if (type === "Compras por proveedor") {
     rows = state.suppliers.map((s) => ({ Proveedor: s.name, "Total comprado": fmtMoney(state.invoices.filter((i) => i.supplierId === s.id && i.status !== "cancelled" && (branchFilter === "all" || i.branchId === branchFilter)).reduce((sum, i) => sum + i.total, 0)) }));
   } else if (type === "Historial de pedidos sugeridos") {
@@ -2151,6 +2440,9 @@ function ConfigView({ state, mutate, audit, onReset }) {
             <Select value={cfg.inventoryFrequency} onChange={(e) => setCfg({ ...cfg, inventoryFrequency: e.target.value })}>
               <option value="diario">Diaria</option><option value="semanal">Semanal</option><option value="mensual">Mensual</option><option value="extraordinario">Extraordinaria</option>
             </Select>
+          </Field>
+          <Field label="Límite de tolerancia para diferencias de inventario (%)" hint="Por debajo de este % la diferencia se marca como 'menor'; por encima, como 'significativa'.">
+            <TextInput type="number" min="0" step="0.1" value={cfg.inventoryToleranceLimit ?? 5} onChange={(e) => setCfg({ ...cfg, inventoryToleranceLimit: clampNum(e.target.value) })} />
           </Field>
           <Field label="Periodo de análisis del estándar de mermas" hint="El estándar por sucursal se define en cada sucursal (módulo Sucursales).">
             <Select value={cfg.mermaPeriod || "mensual"} onChange={(e) => setCfg({ ...cfg, mermaPeriod: e.target.value })}>
