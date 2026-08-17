@@ -414,7 +414,7 @@ function seedState() {
     branches: [{ id: branchId, number: 1, name: "Sucursal Centro", status: "active", mermaStandardPercent: 3, folioPrefix: "SC" }],
     suppliers: [{ id: supplierId, name: "PROPIMEX", productTypes: "Bebidas", paymentDueDays: 30, status: "active" }],
     products, lots,
-    invoices: [], mermas: [], physicalInventories: [],
+    invoices: [], mermas: [], physicalInventories: [], inventoryAdjustments: [],
     users: [
       { id: uid("usr"), username: "1", password: "1971", role: "general_admin", name: "Administrador General", branchId: null, status: "active", failedAttempts: 0, lockedUntil: null, lastLogin: null },
       { id: uid("usr"), username: "100", password: "1234", role: "branch_admin", name: "Encargado Sucursal Centro", branchId, status: "active", failedAttempts: 0, lockedUntil: null, lastLogin: null },
@@ -1566,7 +1566,11 @@ function InventoryCaptureView({ state, mutate, inventory, currentUser, audit, on
     audit("Inventario físico", `Guardó avance del inventario ${inventory.folio}`);
   };
 
-  const finalize = () => {
+  const [pendingFinalize, setPendingFinalize] = useState(null);
+  const [adjustReason, setAdjustReason] = useState("");
+  const [adjustObservations, setAdjustObservations] = useState("");
+
+  const computeFinalizeResult = () => {
     const consumption = []; let lotsNext = state.lots;
     let faltantes = 0, sobrantes = 0, valorFaltantes = 0, valorSobrantes = 0;
     const enrichedCounts = [];
@@ -1588,16 +1592,38 @@ function InventoryCaptureView({ state, mutate, inventory, currentUser, audit, on
       lotsNext = reconcileLotsForCount(lotsNext, p.id, inventory.branchId, captured);
     });
     const suggested = computeSuggestedOrders({ ...state, lots: lotsNext }, inventory.branchId);
+    const hasDifferences = enrichedCounts.some((c) => c.difference !== 0);
+    const hasSignificant = enrichedCounts.some((c) => c.diffLevel === "diferencia_significativa");
+    return { consumption, enrichedCounts, lotsNext, suggested, faltantes, sobrantes, valorFaltantes, valorSobrantes, hasDifferences, hasSignificant };
+  };
+
+  const applyFinalize = (result, reason, observations) => {
+    const { consumption, enrichedCounts, lotsNext, suggested, faltantes, sobrantes, valorFaltantes, valorSobrantes, hasSignificant } = result;
+    const needsAuth = hasSignificant && currentUser.role !== "general_admin";
+    const newAdjustments = enrichedCounts.filter((c) => c.difference !== 0).map((c) => ({
+      id: uid("adj"), inventoryId: inventory.id, inventoryFolio: inventory.folio,
+      productId: c.productId, branchId: inventory.branchId,
+      adjustedQuantity: c.difference, previousStock: c.theoretical, newStock: c.total,
+      date: todayISO(), user: currentUser.name, reason, observations, createdAt: nowStamp(),
+    }));
     mutate((s) => ({
       ...s, lots: lotsNext,
       physicalInventories: s.physicalInventories.map((pi) => (pi.id === inventory.id ? {
         ...pi, counts: enrichedCounts, consumption, suggestedOrder: suggested,
         status: "finalizado", closedAt: nowStamp(),
         faltantes, sobrantes, valorFaltantes, valorSobrantes, impactoNeto: valorSobrantes - valorFaltantes,
-        toleranceLimit: tolerance,
+        toleranceLimit: tolerance, requiresAuthorization: needsAuth, authorized: !needsAuth,
       } : pi)),
+      inventoryAdjustments: [...(s.inventoryAdjustments || []), ...newAdjustments],
     }));
-    audit("Inventario físico", `Finalizó el inventario ${inventory.folio}`);
+    audit("Inventario físico", `Finalizó el inventario ${inventory.folio}${newAdjustments.length ? ` — ${newAdjustments.length} ajuste(s) generado(s)` : ""}`);
+    setPendingFinalize(null); setAdjustReason(""); setAdjustObservations("");
+  };
+
+  const startFinalize = () => {
+    const result = computeFinalizeResult();
+    if (result.hasDifferences) setPendingFinalize(result);
+    else applyFinalize(result, "", "");
   };
 
   return (
@@ -1635,13 +1661,52 @@ function InventoryCaptureView({ state, mutate, inventory, currentUser, audit, on
       </Card>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
         <Btn variant="secondary" icon={CheckCircle2} onClick={saveDraft}>Guardar</Btn>
-        <Btn icon={CheckCircle2} onClick={finalize}>Finalizar inventario</Btn>
+        <Btn icon={CheckCircle2} onClick={startFinalize}>Finalizar inventario</Btn>
       </div>
+      {pendingFinalize && (
+        <Modal title="Confirmar ajuste de inventario" onClose={() => setPendingFinalize(null)} width={680}>
+          <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>Se encontraron diferencias entre lo contado y la existencia según registros. Esto generará un ajuste de inventario para cada producto con diferencia — queda registrado en el historial y nunca se aplica sin motivo.</p>
+          <div style={{ maxHeight: 220, overflow: "auto", border: `1px solid ${T.border}`, borderRadius: 8, marginBottom: 12 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr><Th>Producto</Th><Th>Anterior</Th><Th>Posterior</Th><Th>Cantidad ajustada</Th></tr></thead>
+              <tbody>
+                {pendingFinalize.enrichedCounts.filter((c) => c.difference !== 0).map((c) => (
+                  <tr key={c.productId}>
+                    <Td>{state.products.find((p) => p.id === c.productId)?.name || "—"}</Td>
+                    <Td>{c.theoretical}</Td>
+                    <Td>{c.total}</Td>
+                    <Td><span style={{ color: c.difference < 0 ? T.red : T.orange, fontWeight: 700 }}>{c.difference > 0 ? "+" : ""}{c.difference}</span></Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {pendingFinalize.hasSignificant && currentUser.role !== "general_admin" && (
+            <div style={{ fontSize: 12.5, color: T.orange, fontWeight: 600, marginBottom: 10 }}>Hay diferencias significativas — este inventario quedará marcado como pendiente de autorización del Administrador General.</div>
+          )}
+          <Field label="Motivo del ajuste"><TextInput value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} placeholder="Ej. conteo físico de rutina, robo detectado, error de captura previo…" /></Field>
+          <div style={{ marginTop: 10 }}>
+            <Field label="Observaciones (opcional)"><TextArea rows={2} value={adjustObservations} onChange={(e) => setAdjustObservations(e.target.value)} /></Field>
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+            <Btn variant="ghost" onClick={() => setPendingFinalize(null)}>Volver</Btn>
+            <Btn disabled={!adjustReason.trim()} icon={CheckCircle2} onClick={() => applyFinalize(pendingFinalize, adjustReason, adjustObservations)}>Confirmar y finalizar</Btn>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
 
-function InventoryDetailView({ state, inventory, onClose }) {
+function InventoryDetailView({ state, mutate, currentUser, audit, inventory, onClose }) {
+  const isGeneral = currentUser.role === "general_admin";
+  const adjustments = (state.inventoryAdjustments || []).filter((a) => a.inventoryId === inventory.id);
+
+  const authorize = () => {
+    mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (pi.id === inventory.id ? { ...pi, authorized: true, authorizedBy: currentUser.name, authorizedAt: nowStamp() } : pi)) }));
+    audit("Inventario físico", `Autorizó el ajuste del inventario ${inventory.folio}`);
+  };
+
   return (
     <div>
       <Card style={{ marginBottom: 14 }}>
@@ -1657,6 +1722,17 @@ function InventoryDetailView({ state, inventory, onClose }) {
         </div>
         {inventory.status === "cancelado" && inventory.cancelReason && <div style={{ fontSize: 12, color: T.gray500, marginTop: 8 }}>Motivo de cancelación: {inventory.cancelReason}</div>}
       </Card>
+      {inventory.requiresAuthorization && !inventory.authorized && (
+        <Card style={{ borderTop: `3px solid ${T.orange}`, marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ fontSize: 13, color: T.orange, fontWeight: 700 }}>⚠ Este inventario tuvo diferencias significativas y está pendiente de autorización del Administrador General.</div>
+            {isGeneral && <Btn small icon={CheckCircle2} onClick={authorize}>Autorizar ajuste</Btn>}
+          </div>
+        </Card>
+      )}
+      {inventory.authorized && inventory.authorizedBy && (
+        <div style={{ fontSize: 12, color: T.green700, marginBottom: 14 }}>✓ Ajuste autorizado por {inventory.authorizedBy} el {inventory.authorizedAt?.date}.</div>
+      )}
       {inventory.faltantes != null && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 14 }}>
           <KpiCard label="Faltantes (pz)" value={inventory.faltantes} accent={T.red} />
@@ -1665,7 +1741,7 @@ function InventoryDetailView({ state, inventory, onClose }) {
           <KpiCard label="Impacto económico neto" value={fmtMoney(inventory.impactoNeto)} accent={inventory.impactoNeto < 0 ? T.red : T.green700} />
         </div>
       )}
-      <Card style={{ padding: 0, overflow: "auto" }}>
+      <Card style={{ padding: 0, overflow: "auto", marginBottom: 14 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Producto</Th><Th>Física</Th><Th>Teórica</Th><Th>Diferencia</Th><Th>% Variación</Th><Th>Costo de la diferencia</Th><Th>Estado</Th></tr></thead>
           <tbody>
@@ -1683,6 +1759,30 @@ function InventoryDetailView({ state, inventory, onClose }) {
           </tbody>
         </table>
       </Card>
+      {adjustments.length > 0 && (
+        <Card style={{ padding: 0, overflow: "auto" }}>
+          <div style={{ padding: "14px 16px 0" }}>
+            <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>Ajustes generados</h4>
+            <div style={{ fontSize: 11.5, color: T.gray500 }}>Cada ajuste queda registrado permanentemente, con el motivo capturado al finalizar el inventario.</div>
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+            <thead><tr><Th>Producto</Th><Th>Inventario anterior</Th><Th>Inventario posterior</Th><Th>Cantidad ajustada</Th><Th>Motivo</Th><Th>Usuario</Th><Th>Fecha</Th></tr></thead>
+            <tbody>
+              {adjustments.map((a) => (
+                <tr key={a.id}>
+                  <Td>{state.products.find((p) => p.id === a.productId)?.name || "—"}</Td>
+                  <Td>{a.previousStock}</Td>
+                  <Td>{a.newStock}</Td>
+                  <Td><span style={{ color: a.adjustedQuantity < 0 ? T.red : T.orange, fontWeight: 700 }}>{a.adjustedQuantity > 0 ? "+" : ""}{a.adjustedQuantity}</span></Td>
+                  <Td>{a.reason}</Td>
+                  <Td>{a.user}</Td>
+                  <Td>{fmtDate(a.date)}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
     </div>
   );
 }
@@ -1735,7 +1835,7 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
   if (openInventory) {
     return isInventoryOpen(openInventory)
       ? <InventoryCaptureView state={state} mutate={mutate} inventory={openInventory} currentUser={currentUser} audit={audit} onClose={() => setOpenId(null)} />
-      : <InventoryDetailView state={state} inventory={openInventory} onClose={() => setOpenId(null)} />;
+      : <InventoryDetailView state={state} mutate={mutate} currentUser={currentUser} audit={audit} inventory={openInventory} onClose={() => setOpenId(null)} />;
   }
 
   return (
@@ -1759,7 +1859,7 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
                 <Td mono>{pi.folio}</Td><Td>{fmtDate(pi.date)}</Td><Td>{INV_TYPES[pi.type] || "Inventario Físico"}</Td>
                 <Td>{state.branches.find((b) => b.id === pi.branchId)?.name || "—"}</Td>
                 <Td>{(pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", ") || "—"}</Td>
-                <Td><InvStatusPill pi={pi} /></Td>
+                <Td><div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}><InvStatusPill pi={pi} />{pi.requiresAuthorization && !pi.authorized && <Pill bg="#FDE6D2" fg={T.orange}>Requiere autorización</Pill>}</div></Td>
                 <Td>
                   <div style={{ display: "flex", gap: 6 }}>
                     <Btn small variant="secondary" onClick={() => setOpenId(pi.id)}>{isInventoryOpen(pi) ? "Continuar" : "Ver detalle"}</Btn>
