@@ -1433,7 +1433,7 @@ function BranchesView({ state, mutate, audit }) {
               <StatusPill status={b.status} />
             </div>
             <div style={{ fontSize: 12, color: T.gray500, marginTop: 8 }}>Estándar de merma: <b style={{ color: T.ink }}>{b.mermaStandardPercent != null ? `${b.mermaStandardPercent}%` : "No configurado"}</b></div>
-            <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
+            <div style={{ display: "flex", gap: 6, marginTop: 14, flexWrap: "wrap" }}>
               <Btn small variant="secondary" icon={Pencil} onClick={() => setForm(b)}>Editar</Btn>
               <Btn small variant="danger" icon={Ban} onClick={() => toggle(b)}>{b.status === "active" ? "Desactivar" : "Reactivar"}</Btn>
               <Btn small variant="danger" icon={Trash2} onClick={() => setDeleteTarget(b)}>Eliminar</Btn>
@@ -1605,34 +1605,36 @@ function InvoiceForm({ state, branchId, initial, onSave, onClose }) {
             <span style={{ fontSize: 12.5, fontWeight: 700, color: T.gray500 }}>PRODUCTOS DE LA FACTURA</span>
             <Btn small variant="secondary" icon={Plus} onClick={addItem}>Agregar producto</Btn>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1.5fr 0.7fr 0.7fr 0.9fr 0.9fr 1fr auto", gap: 6, padding: "0 8px", fontSize: 10.5, fontWeight: 700, color: T.gray500, textTransform: "uppercase" }}>
-            <span>Producto</span><span>Paquetes</span><span>Piezas sueltas</span><span>Costo/paquete</span><span>Costo/pieza</span><span>Caducidad</span><span></span>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4 }}>
-            {f.items.map((it) => {
-              const prod = state.products.find((p) => p.id === it.productId);
-              const costPerUnit = prod ? (it.costPerPackage / prod.piecesPerPackage) : 0;
-              const totalPieces = it.packages * (prod?.piecesPerPackage || 0) + (it.looseUnits || 0);
-              return (
-                <div key={it.id} style={{ background: T.cream, padding: 8, borderRadius: 8 }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1.5fr 0.7fr 0.7fr 0.9fr 0.9fr 1fr auto", gap: 6, alignItems: "center" }}>
-                    <Select value={it.productId} onChange={(e) => onProductChange(it.id, e.target.value)}>
-                      {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                    </Select>
-                    <TextInput type="number" min="0" value={it.packages} onChange={(e) => updateItem(it.id, { packages: clampNum(e.target.value) })} placeholder="Paquetes" />
-                    <TextInput type="number" min="0" value={it.looseUnits || 0} onChange={(e) => updateItem(it.id, { looseUnits: clampNum(e.target.value) })} placeholder="Piezas" />
-                    <TextInput type="number" min="0" step="0.01" value={it.costPerPackage} onChange={(e) => updateItem(it.id, { costPerPackage: clampNum(e.target.value) })} placeholder="Costo/paq" />
-                    <div style={{ fontSize: 11.5, color: T.gray500 }}>{fmtMoney(costPerUnit)}/pz</div>
-                    <TextInput type="date" value={it.expirationDate} min={f.entryDate} onChange={(e) => updateItem(it.id, { expirationDate: e.target.value })} />
-                    <button onClick={() => removeItem(it.id)} style={{ border: "none", background: "#fff", borderRadius: 6, padding: 5, cursor: "pointer" }}><Trash2 size={13} color={T.red} /></button>
+          <div style={{ overflowX: "auto" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.5fr) minmax(0,0.7fr) minmax(0,0.7fr) minmax(0,0.9fr) minmax(0,0.9fr) minmax(0,1fr) auto", gap: 6, padding: "0 8px", fontSize: 10.5, fontWeight: 700, color: T.gray500, textTransform: "uppercase", minWidth: 640 }}>
+              <span>Producto</span><span>Paquetes</span><span>Piezas sueltas</span><span>Costo/paquete</span><span>Costo/pieza</span><span>Caducidad</span><span></span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4, minWidth: 640 }}>
+              {f.items.map((it) => {
+                const prod = state.products.find((p) => p.id === it.productId);
+                const costPerUnit = prod ? (it.costPerPackage / prod.piecesPerPackage) : 0;
+                const totalPieces = it.packages * (prod?.piecesPerPackage || 0) + (it.looseUnits || 0);
+                return (
+                  <div key={it.id} style={{ background: T.cream, padding: 8, borderRadius: 8 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.5fr) minmax(0,0.7fr) minmax(0,0.7fr) minmax(0,0.9fr) minmax(0,0.9fr) minmax(0,1fr) auto", gap: 6, alignItems: "center" }}>
+                      <Select value={it.productId} onChange={(e) => onProductChange(it.id, e.target.value)}>
+                        {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </Select>
+                      <TextInput type="number" min="0" value={it.packages} onChange={(e) => updateItem(it.id, { packages: clampNum(e.target.value) })} placeholder="Paquetes" />
+                      <TextInput type="number" min="0" value={it.looseUnits || 0} onChange={(e) => updateItem(it.id, { looseUnits: clampNum(e.target.value) })} placeholder="Piezas" />
+                      <TextInput type="number" min="0" step="0.01" value={it.costPerPackage} onChange={(e) => updateItem(it.id, { costPerPackage: clampNum(e.target.value) })} placeholder="Costo/paq" />
+                      <div style={{ fontSize: 11.5, color: T.gray500 }}>{fmtMoney(costPerUnit)}/pz</div>
+                      <TextInput type="date" value={it.expirationDate} min={f.entryDate} onChange={(e) => updateItem(it.id, { expirationDate: e.target.value })} />
+                      <button onClick={() => removeItem(it.id)} style={{ border: "none", background: "#fff", borderRadius: 6, padding: 5, cursor: "pointer" }}><Trash2 size={13} color={T.red} /></button>
+                    </div>
+                    {prod && <div style={{ fontSize: 11, color: T.gray500, marginTop: 4, paddingLeft: 2 }}>= {totalPieces} piezas totales · {fmtMoney(lineTotal(it, prod))}
+                      {prod.lastCostPerPackage != null && <span> · último costo registrado: {fmtMoney(prod.lastCostPerPackage)}/paq</span>}
+                    </div>}
                   </div>
-                  {prod && <div style={{ fontSize: 11, color: T.gray500, marginTop: 4, paddingLeft: 2 }}>= {totalPieces} piezas totales · {fmtMoney(lineTotal(it, prod))}
-                    {prod.lastCostPerPackage != null && <span> · último costo registrado: {fmtMoney(prod.lastCostPerPackage)}/paq</span>}
-                  </div>}
-                </div>
-              );
-            })}
-            {!f.items.length && <EmptyState text="Agrega al menos un producto." />}
+                );
+              })}
+              {!f.items.length && <EmptyState text="Agrega al menos un producto." />}
+            </div>
           </div>
         </div>
         <div style={{ textAlign: "right", fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, fontWeight: 700 }}>Total: {fmtMoney(total)}</div>
