@@ -318,6 +318,57 @@ function hasNearbyMerma(state, productId, branchId, date) {
   return state.mermas.some((m) => m.productId === productId && m.branchId === branchId && m.status !== "cancelled" && Math.abs((new Date(`${m.date}T00:00:00`) - d0) / 86400000) <= 3);
 }
 
+/* Kardex: historial de movimientos de un producto en una sucursal (entradas,
+   mermas, y los ajustes de inventario físico — que ya incluyen tanto los
+   faltantes por consumo como los sobrantes, sin volver a contarlos aparte
+   como "consumo", ya que son el mismo movimiento de inventario visto desde
+   otro ángulo). Se muestra del más reciente al más antiguo, con la
+   existencia resultante después de cada movimiento. */
+function computeKardex(state, productId, branchId) {
+  const rows = [];
+  const seqOf = (id) => id.split("_").slice(1).join("_"); // parte con precisión de milisegundos del id
+
+  state.invoices.filter((i) => i.branchId === branchId && i.status !== "cancelled").forEach((i) => {
+    (i.items || []).filter((it) => it.productId === productId).forEach((it) => {
+      const prod = state.products.find((p) => p.id === productId);
+      const qty = it.packages * (prod?.piecesPerPackage || 1) + (it.looseUnits || 0);
+      if (qty <= 0) return;
+      rows.push({
+        date: i.entryDate, sortKey: `${i.entryDate}_${seqOf(i.id)}`,
+        type: "entrada", label: `Entrada — Factura ${i.invoiceNumber}`,
+        detail: state.suppliers.find((s) => s.id === i.supplierId)?.name || "—",
+        signedQty: qty, user: i.createdBy || "—",
+      });
+    });
+  });
+
+  state.mermas.filter((m) => m.productId === productId && m.branchId === branchId && m.status !== "cancelled").forEach((m) => {
+    rows.push({
+      date: m.date, sortKey: `${m.date}_${seqOf(m.id)}`,
+      type: "merma", label: `Merma — ${MERMA_CLASS[m.classification] || m.classification}`,
+      detail: m.reason, signedQty: -m.quantity, user: m.responsible,
+    });
+  });
+
+  (state.inventoryAdjustments || []).filter((a) => a.productId === productId && a.branchId === branchId).forEach((a) => {
+    rows.push({
+      date: a.date, sortKey: `${a.date}_${seqOf(a.id)}`,
+      type: a.adjustedQuantity < 0 ? "salida" : "ajuste",
+      label: a.adjustedQuantity < 0 ? `Salida — Consumo (${a.inventoryFolio})` : `Entrada — Ajuste por sobrante (${a.inventoryFolio})`,
+      detail: a.reason, signedQty: a.adjustedQuantity, user: a.user,
+    });
+  });
+
+  rows.sort((r1, r2) => r2.sortKey.localeCompare(r1.sortKey));
+
+  let running = theoreticalStock(state.lots, productId, branchId);
+  return rows.map((r) => {
+    const balanceAfter = running;
+    running -= r.signedQty;
+    return { ...r, balanceAfter };
+  });
+}
+
 function computeCrossAnalysis(state, branchId, start, end) {
   const products = state.products.filter((p) => p.status === "active");
   return products.map((p) => {
@@ -1191,6 +1242,58 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
 }
 
 /* ============================== PRODUCTOS ============================== */
+const KARDEX_TYPE_META = {
+  entrada: { fg: T.green700, bg: T.green100 },
+  merma: { fg: T.red, bg: "#FBDCDA" },
+  salida: { fg: T.orange, bg: "#FDE6D2" },
+  ajuste: { fg: T.green700, bg: T.green100 },
+};
+
+function KardexModal({ state, productId, branches, activeBranchId, onClose }) {
+  const [branchId, setBranchId] = useState(activeBranchId || branches[0]?.id || "");
+  const product = state.products.find((p) => p.id === productId);
+  const rows = branchId ? computeKardex(state, productId, branchId) : [];
+  const exportRows = rows.map((r) => ({
+    Fecha: fmtDate(r.date), Movimiento: r.label, Detalle: r.detail || "—",
+    Entrada: r.signedQty > 0 ? r.signedQty : "", Salida: r.signedQty < 0 ? Math.abs(r.signedQty) : "",
+    "Existencia resultante": r.balanceAfter, Usuario: r.user || "—",
+  }));
+
+  return (
+    <Modal title={`Kardex — ${product?.name || "—"}`} onClose={onClose} width={760}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+        {branches.length > 1 ? (
+          <Field label="Sucursal">
+            <Select value={branchId} onChange={(e) => setBranchId(e.target.value)}>
+              {branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+            </Select>
+          </Field>
+        ) : <div />}
+        <ExportBar rows={exportRows} label={`kardex-${product?.name || "producto"}`} />
+      </div>
+      <div style={{ maxHeight: 420, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><Th>Fecha</Th><Th>Movimiento</Th><Th>Detalle</Th><Th>Entrada</Th><Th>Salida</Th><Th>Existencia</Th><Th>Usuario</Th></tr></thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>
+                <Td>{fmtDate(r.date)}</Td>
+                <Td><Pill bg={KARDEX_TYPE_META[r.type].bg} fg={KARDEX_TYPE_META[r.type].fg}>{r.label}</Pill></Td>
+                <Td>{r.detail || "—"}</Td>
+                <Td>{r.signedQty > 0 ? `+${r.signedQty}` : ""}</Td>
+                <Td>{r.signedQty < 0 ? Math.abs(r.signedQty) : ""}</Td>
+                <Td><b>{r.balanceAfter}</b></Td>
+                <Td>{r.user || "—"}</Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!rows.length && <EmptyState text="Este producto no tiene movimientos registrados en esta sucursal." />}
+      </div>
+    </Modal>
+  );
+}
+
 function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
   const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", category: "", notes: "", image: null, idealStock: {} });
   const [formError, setFormError] = useState("");
@@ -1246,10 +1349,11 @@ function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
   );
 }
 
-function ProductsView({ state, mutate, branches, activeBranchId, audit }) {
+function ProductsView({ state, mutate, branches, activeBranchId, currentUser, audit }) {
   const [q, setQ] = useState(""); const [supplierFilter, setSupplierFilter] = useState("all");
   const [editing, setEditing] = useState(null); const [showForm, setShowForm] = useState(false);
   const [unit, setUnit] = useState("piezas");
+  const [kardexProductId, setKardexProductId] = useState(null);
 
   const list = state.products.filter((p) =>
     (supplierFilter === "all" || p.supplierId === supplierFilter) &&
@@ -1318,9 +1422,10 @@ function ProductsView({ state, mutate, branches, activeBranchId, audit }) {
                   <Td>{unit === "piezas" ? `${stock} pz` : packagesAndPieces(stock, p.piecesPerPackage)}</Td>
                   <Td><StatusPill status={p.status} /></Td>
                   <Td>
-                    <div style={{ display: "flex", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button onClick={() => { setEditing(p); setShowForm(true); }} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Pencil size={13} /></button>
                       <button onClick={() => toggleStatus(p)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Ban size={13} color={p.status === "active" ? T.red : T.green700} /></button>
+                      <Btn small variant="secondary" onClick={() => setKardexProductId(p.id)}>Kardex</Btn>
                     </div>
                   </Td>
                 </tr>
@@ -1331,6 +1436,7 @@ function ProductsView({ state, mutate, branches, activeBranchId, audit }) {
         {!list.length && <EmptyState text="No hay productos que coincidan con la búsqueda." />}
       </Card>
       {showForm && <ProductForm initial={editing} suppliers={state.suppliers.filter((s) => s.status === "active")} branches={branches} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+      {kardexProductId && <KardexModal state={state} productId={kardexProductId} branches={branches} activeBranchId={activeBranchId} onClose={() => setKardexProductId(null)} />}
     </div>
   );
 }
