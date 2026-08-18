@@ -539,7 +539,7 @@ function TextArea(props) { return <textarea {...props} style={{ ...inputStyle, r
 
 function Modal({ title, onClose, children, width = 560 }) {
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(15,42,30,0.45)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 50, padding: "40px 16px", overflowY: "auto" }} onClick={onClose}>
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,42,30,0.45)", display: "flex", alignItems: "flex-start", justifyContent: "center", zIndex: 50, padding: "40px 16px", overflowY: "auto" }}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: "#fff", borderRadius: 16, width: "100%", maxWidth: width, padding: 24, boxShadow: "0 20px 60px rgba(15,42,30,0.25)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <h3 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, color: T.ink }}>{title}</h3>
