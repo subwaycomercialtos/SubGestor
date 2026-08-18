@@ -104,6 +104,15 @@ function theoreticalStock(lots, productId, branchId) {
     .reduce((s, l) => s + l.remainingPieces, 0);
 }
 
+/* Costo unitario ponderado de la existencia actual de un producto/sucursal,
+   a partir del costo real de cada lote activo (no un valor capturado a mano). */
+function weightedUnitCost(lots, productId, branchId) {
+  const relevant = lots.filter((l) => l.productId === productId && l.branchId === branchId && l.status === "active");
+  const qty = relevant.reduce((s, l) => s + l.remainingPieces, 0);
+  const val = relevant.reduce((s, l) => s + l.remainingPieces * (l.costPerUnit || 0), 0);
+  return qty > 0 ? val / qty : 0;
+}
+
 function reconcileLotsForCount(lots, productId, branchId, newTotal) {
   const relevant = lots.filter((l) => l.productId === productId && l.branchId === branchId && l.status === "active");
   const others = lots.filter((l) => !(l.productId === productId && l.branchId === branchId && l.status === "active"));
@@ -294,6 +303,21 @@ function computeMermaAnalytics(state, filters) {
    histórico no guarda su propio costo), cuánto se perdió en mermas, y cuánto
    queda en existencia — igual que pide la especificación
    (Compras → Entradas → Inventario → Consumo → Mermas → Existencia final). */
+/* Cuántas veces un producto tuvo faltante o sobrante en el historial de
+   inventarios finalizados de una sucursal — para detectar diferencias
+   recurrentes en el mismo producto. */
+function countRecurrence(branchInvs, productId, direction) {
+  return branchInvs.filter((pi) => (pi.counts || []).some((c) => c.productId === productId && (direction === "falt" ? c.difference < 0 : c.difference > 0))).length;
+}
+
+/* ¿Hay una merma registrada de este producto/sucursal cerca de la fecha del
+   inventario (±3 días)? Si hay un faltante sin merma cercana, podría ser una
+   merma no registrada. */
+function hasNearbyMerma(state, productId, branchId, date) {
+  const d0 = new Date(`${date}T00:00:00`);
+  return state.mermas.some((m) => m.productId === productId && m.branchId === branchId && m.status !== "cancelled" && Math.abs((new Date(`${m.date}T00:00:00`) - d0) / 86400000) <= 3);
+}
+
 function computeCrossAnalysis(state, branchId, start, end) {
   const products = state.products.filter((p) => p.status === "active");
   return products.map((p) => {
@@ -374,6 +398,20 @@ function generateInventoryFolio(state, branchId) {
   const prefix = branch?.folioPrefix || (branch ? suggestFolioPrefix(branch.name) : "INV");
   const seq = state.physicalInventories.filter((pi) => pi.branchId === branchId).length + 1;
   return `${prefix}-${seq.toString().padStart(4, "0")}`;
+}
+
+/* Recalcula los folios de TODOS los inventarios de una sucursal según su
+   prefijo actual, respetando el orden en que se crearon — útil si el
+   prefijo cambió o si un inventario se creó antes de tener uno asignado. */
+function recalcBranchFolios(state, branchId) {
+  const branch = state.branches.find((b) => b.id === branchId);
+  const prefix = branch?.folioPrefix || suggestFolioPrefix(branch?.name || "");
+  const branchInvs = state.physicalInventories
+    .filter((pi) => pi.branchId === branchId)
+    .sort((a, b) => (a.createdAt?.date || a.date).localeCompare(b.createdAt?.date || b.date) || (a.createdAt?.time || "").localeCompare(b.createdAt?.time || ""));
+  const folioById = {};
+  branchInvs.forEach((pi, idx) => { folioById[pi.id] = `${prefix}-${(idx + 1).toString().padStart(4, "0")}`; });
+  return folioById;
 }
 
 function computeSuggestedOrders(state, branchId) {
@@ -828,11 +866,12 @@ function DashboardView({ state, activeBranchId, role, currentUser, branches }) {
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
-        {[["general", "General"], ["mermas", "Mermas"], ["reportes", "Reportes"]].map(([k, label]) => (
+        {[["general", "General"], ["mermas", "Mermas"], ["inventario", "Inventario Inteligente"], ["reportes", "Reportes"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
       {tab === "general" && <DashboardGeneralTab state={state} activeBranchId={activeBranchId} role={role} onGoToMermas={() => setTab("mermas")} />}
+      {tab === "inventario" && <InventorySmartAnalysisTab state={state} isGeneral={isGeneral} branchId={branchId} />}
       {tab === "mermas" && (
         <div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
@@ -844,6 +883,196 @@ function DashboardView({ state, activeBranchId, role, currentUser, branches }) {
         </div>
       )}
       {tab === "reportes" && <ReportsView state={state} branches={branches} />}
+    </div>
+  );
+}
+
+function InventoryProductHistoryModal({ state, productId, branchId, branchInvs, onClose }) {
+  const productName = state.products.find((p) => p.id === productId)?.name || "—";
+  const invRows = branchInvs.filter((pi) => (pi.counts || []).some((c) => c.productId === productId && c.difference))
+    .map((pi) => ({ pi, c: pi.counts.find((c) => c.productId === productId) }));
+  const mermaRows = state.mermas.filter((m) => m.productId === productId && m.branchId === branchId && m.status !== "cancelled").sort((a, b) => b.date.localeCompare(a.date));
+  return (
+    <Modal title={`Historial — ${productName}`} onClose={onClose} width={620}>
+      <h4 style={{ fontFamily: "'Space Grotesk',sans-serif", margin: "0 0 8px" }}>Diferencias en inventarios anteriores</h4>
+      {invRows.length ? (
+        <table style={{ width: "100%", fontSize: 12.5, marginBottom: 16 }}>
+          <thead><tr><Th>Folio</Th><Th>Fecha</Th><Th>Diferencia</Th><Th>Estado</Th></tr></thead>
+          <tbody>{invRows.map(({ pi, c }) => <tr key={pi.id}><Td mono>{pi.folio}</Td><Td>{fmtDate(pi.date)}</Td><Td>{c.difference > 0 ? "+" : ""}{c.difference}</Td><Td><DiffPill level={c.diffLevel} /></Td></tr>)}</tbody>
+        </table>
+      ) : <EmptyState text="Sin diferencias registradas en inventarios anteriores." />}
+      <h4 style={{ fontFamily: "'Space Grotesk',sans-serif", margin: "0 0 8px" }}>Mermas registradas</h4>
+      {mermaRows.length ? (
+        <table style={{ width: "100%", fontSize: 12.5 }}>
+          <thead><tr><Th>Fecha</Th><Th>Cantidad</Th><Th>Clasificación</Th><Th>Motivo</Th></tr></thead>
+          <tbody>{mermaRows.map((m) => <tr key={m.id}><Td>{fmtDate(m.date)}</Td><Td>{m.quantity} {m.unit}</Td><Td>{MERMA_CLASS[m.classification]}</Td><Td>{m.reason}</Td></tr>)}</tbody>
+        </table>
+      ) : <EmptyState text="Sin mermas registradas para este producto." />}
+    </Modal>
+  );
+}
+
+function InventorySmartAnalysisTab({ state, isGeneral, branchId }) {
+  const [selBranch, setSelBranch] = useState(branchId || state.branches[0]?.id || "");
+  const targetBranchId = isGeneral ? selBranch : branchId;
+  const [historyProduct, setHistoryProduct] = useState(null);
+
+  const branchInvs = state.physicalInventories.filter((pi) => pi.branchId === targetBranchId && isInventoryFinal(pi))
+    .sort((a, b) => (a.createdAt?.date || a.date).localeCompare(b.createdAt?.date || b.date) || (a.createdAt?.time || "").localeCompare(b.createdAt?.time || ""));
+  const [selInvId, setSelInvId] = useState(null);
+  const inv = branchInvs.find((pi) => pi.id === selInvId) || branchInvs[branchInvs.length - 1] || null;
+
+  if (!targetBranchId || !branchInvs.length) {
+    return (
+      <div>
+        {isGeneral && (
+          <Card style={{ marginBottom: 14 }}>
+            <Field label="Sucursal">
+              <Select value={selBranch} onChange={(e) => setSelBranch(e.target.value)}>
+                {state.branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </Select>
+            </Field>
+          </Card>
+        )}
+        <EmptyState text="Aún no hay inventarios físicos finalizados en esta sucursal para analizar." />
+      </div>
+    );
+  }
+
+  const counts = inv.counts || [];
+  const totalRevisados = counts.length;
+  const sinDif = counts.filter((c) => c.difference === 0).length;
+  const conMenor = counts.filter((c) => c.diffLevel === "diferencia_menor").length;
+  const conSignif = counts.filter((c) => c.diffLevel === "diferencia_significativa").length;
+  const totalFaltantes = counts.filter((c) => c.difference < 0).reduce((s, c) => s + Math.abs(c.difference), 0);
+  const totalSobrantes = counts.filter((c) => c.difference > 0).reduce((s, c) => s + c.difference, 0);
+  const impactoEconomico = counts.reduce((s, c) => s + (c.diffCost || 0), 0);
+  const coincidencia = totalRevisados > 0 ? (sinDif / totalRevisados) * 100 : 100;
+
+  const invIndex = branchInvs.findIndex((pi) => pi.id === inv.id);
+  const prevInv = invIndex > 0 ? branchInvs[invIndex - 1] : null;
+
+  const topIncidence = [...counts].filter((c) => c.difference !== 0).sort((a, b) => Math.abs(b.diffCost || 0) - Math.abs(a.diffCost || 0)).slice(0, 10);
+
+  const alerts = [];
+  counts.forEach((c) => {
+    if (!c.difference) return;
+    const pname = state.products.find((p) => p.id === c.productId)?.name || "—";
+    if (c.diffLevel === "diferencia_significativa") alerts.push(`🔴 ${pname}: diferencia significativa de ${c.difference > 0 ? "+" : ""}${c.difference} pz (${c.diffPercent.toFixed(1)}%).`);
+    const dir = c.difference < 0 ? "falt" : "sobr";
+    const occurrences = countRecurrence(branchInvs, c.productId, dir);
+    if (occurrences >= 2) alerts.push(`🔁 ${pname}: ${dir === "falt" ? "faltante" : "sobrante"} recurrente — ya son ${occurrences} inventarios con este patrón.`);
+    if (c.difference < 0 && !hasNearbyMerma(state, c.productId, targetBranchId, inv.date)) alerts.push(`⚠ ${pname}: hay un faltante sin ninguna merma registrada cerca de esta fecha — posible merma no registrada.`);
+    if (prevInv) {
+      const prevC = (prevInv.counts || []).find((pc) => pc.productId === c.productId);
+      if (prevC && Math.abs(c.diffPercent) > Math.abs(prevC.diffPercent) * 2 && Math.abs(c.diffPercent) > (state.config.inventoryToleranceLimit ?? 5)) {
+        alerts.push(`📈 ${pname}: la diferencia creció mucho respecto al inventario anterior (antes ${prevC.diffPercent.toFixed(1)}%, ahora ${c.diffPercent.toFixed(1)}%).`);
+      }
+    }
+  });
+  topIncidence.slice(0, 3).forEach((c) => {
+    const pname = state.products.find((p) => p.id === c.productId)?.name || "—";
+    if (Math.abs(c.diffCost || 0) > 0) alerts.push(`💰 ${pname}: es de los productos con mayor impacto económico en este conteo (${fmtMoney(c.diffCost)}).`);
+  });
+
+  let trend = null;
+  if (prevInv) {
+    const prevImpact = Math.abs(prevInv.impactoNeto ?? 0);
+    const currImpact = Math.abs(inv.impactoNeto ?? impactoEconomico);
+    trend = Math.abs(currImpact - prevImpact) < 1 ? "constante" : currImpact > prevImpact ? "aumentando" : "disminuyendo";
+  }
+
+  const branchDiffRanking = isGeneral ? state.branches.map((b) => {
+    const lastInv = state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi))
+      .sort((a, c) => (c.createdAt?.date || c.date).localeCompare(a.createdAt?.date || a.date))[0];
+    return { branchName: b.name, diffs: lastInv ? (lastInv.counts || []).filter((c) => c.difference).length : 0, folio: lastInv?.folio || "—" };
+  }).sort((a, b) => b.diffs - a.diffs) : [];
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          {isGeneral && (
+            <Field label="Sucursal">
+              <Select value={selBranch} onChange={(e) => { setSelBranch(e.target.value); setSelInvId(null); }}>
+                {state.branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </Select>
+            </Field>
+          )}
+          <Field label="Inventario a analizar">
+            <Select value={inv.id} onChange={(e) => setSelInvId(e.target.value)}>
+              {branchInvs.map((pi) => <option key={pi.id} value={pi.id}>{pi.folio} — {fmtDate(pi.date)}</option>)}
+            </Select>
+          </Field>
+        </div>
+      </Card>
+
+      <div style={{ fontSize: 13, fontWeight: 700, color: T.gray500, marginBottom: 8 }}>Inventario Físico — {state.branches.find((b) => b.id === targetBranchId)?.name}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 14 }}>
+        <KpiCard label="Productos revisados" value={totalRevisados} accent={T.gray500} />
+        <KpiCard label="Sin diferencias" value={sinDif} accent={T.green700} />
+        <KpiCard label="Diferencias menores" value={conMenor} accent={T.yellow600} />
+        <KpiCard label="Diferencias significativas" value={conSignif} accent={T.red} />
+        <KpiCard label="Faltantes (pz)" value={totalFaltantes} accent={T.red} />
+        <KpiCard label="Sobrantes (pz)" value={totalSobrantes} accent={T.orange} />
+        <KpiCard label="Impacto económico" value={fmtMoney(impactoEconomico)} accent={impactoEconomico < 0 ? T.red : T.green700} />
+        <KpiCard label="% de coincidencia" value={`${coincidencia.toFixed(1)}%`} accent={T.green700} />
+      </div>
+
+      {trend && (
+        <Card style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 13 }}>
+            Comparado con el inventario anterior ({prevInv.folio}), el impacto económico de las diferencias está{" "}
+            <b style={{ color: trend === "aumentando" ? T.red : trend === "disminuyendo" ? T.green700 : T.gray500 }}>
+              {trend === "aumentando" ? "aumentando 📈" : trend === "disminuyendo" ? "disminuyendo 📉" : "constante ➡"}
+            </b>.
+          </div>
+        </Card>
+      )}
+
+      <Card style={{ padding: 0, overflow: "auto", marginBottom: 14 }}>
+        <div style={{ padding: "14px 16px 0" }}>
+          <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>Productos con mayor incidencia</h4>
+          <div style={{ fontSize: 11.5, color: T.gray500 }}>Ordenados por impacto económico. Haz clic en un producto para ver su historial.</div>
+        </div>
+        <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+          <thead><tr><Th>Producto</Th><Th>Diferencia</Th><Th>Impacto económico</Th><Th>Estado</Th></tr></thead>
+          <tbody>
+            {topIncidence.map((c) => (
+              <tr key={c.productId} style={{ cursor: "pointer" }} onClick={() => setHistoryProduct(c.productId)}>
+                <Td><b>{state.products.find((p) => p.id === c.productId)?.name || "—"}</b></Td>
+                <Td>{c.difference > 0 ? "+" : ""}{c.difference}</Td>
+                <Td>{fmtMoney(c.diffCost || 0)}</Td>
+                <Td><DiffPill level={c.diffLevel} /></Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!topIncidence.length && <EmptyState text="Este inventario no tuvo diferencias." />}
+      </Card>
+
+      <Card style={{ marginBottom: 14 }}>
+        <h4 style={{ margin: "0 0 10px", fontFamily: "'Space Grotesk',sans-serif" }}>Alertas inteligentes</h4>
+        {alerts.length ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {alerts.map((a, i) => <div key={i} style={{ fontSize: 12.5, color: T.ink, background: T.cream, borderRadius: 8, padding: "8px 10px" }}>{a}</div>)}
+          </div>
+        ) : <EmptyState text="No se detectaron situaciones que requieran atención." />}
+      </Card>
+
+      {isGeneral && branchDiffRanking.length > 0 && (
+        <Card style={{ padding: 0, overflow: "auto" }}>
+          <div style={{ padding: "14px 16px 0" }}>
+            <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>Sucursales con más diferencias (último inventario de cada una)</h4>
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+            <thead><tr><Th>Sucursal</Th><Th>Último inventario</Th><Th>Productos con diferencia</Th></tr></thead>
+            <tbody>{branchDiffRanking.map((r, i) => <tr key={i}><Td><b>{r.branchName}</b></Td><Td mono>{r.folio}</Td><Td>{r.diffs}</Td></tr>)}</tbody>
+          </table>
+        </Card>
+      )}
+
+      {historyProduct && <InventoryProductHistoryModal state={state} productId={historyProduct} branchId={targetBranchId} branchInvs={branchInvs} onClose={() => setHistoryProduct(null)} />}
     </div>
   );
 }
@@ -963,7 +1192,7 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
 
 /* ============================== PRODUCTOS ============================== */
 function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
-  const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", notes: "", image: null, idealStock: {} });
+  const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", category: "", notes: "", image: null, idealStock: {} });
   const [formError, setFormError] = useState("");
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const onImg = (e) => {
@@ -983,6 +1212,7 @@ function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
           <Field label="Piezas por paquete"><TextInput type="number" min="1" value={f.piecesPerPackage} onChange={(e) => set("piecesPerPackage", clampNum(e.target.value) || 1)} /></Field>
           <Field label="Código de producto"><TextInput value={f.code} onChange={(e) => set("code", e.target.value)} /></Field>
         </div>
+        <Field label="Categoría (opcional)"><TextInput value={f.category || ""} onChange={(e) => set("category", e.target.value)} placeholder="Ej. Bebidas, Lácteos, Abarrotes…" /></Field>
         <Field label="Proveedor">
           <Select value={f.supplierId} onChange={(e) => set("supplierId", e.target.value)}>
             {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -1157,6 +1387,8 @@ function SuppliersView({ state, mutate, audit }) {
 /* ============================== SUCURSALES ============================== */
 function BranchesView({ state, mutate, audit }) {
   const [form, setForm] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const save = (f) => {
     if (f.id) {
       const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : (state.branches.find((b) => b.id === f.id)?.folioPrefix || suggestFolioPrefix(f.name));
@@ -1170,6 +1402,22 @@ function BranchesView({ state, mutate, audit }) {
     setForm(null);
   };
   const toggle = (b) => { mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === b.id ? { ...x, status: x.status === "active" ? "disabled" : "active" } : x)) })); audit("Sucursales", `${b.status === "active" ? "Desactivó" : "Reactivó"} ${b.name}`); };
+  const doDelete = () => {
+    const bId = deleteTarget.id;
+    mutate((s) => ({
+      ...s,
+      branches: s.branches.filter((b) => b.id !== bId),
+      products: s.products.map((p) => (p.idealStock && bId in p.idealStock ? { ...p, idealStock: Object.fromEntries(Object.entries(p.idealStock).filter(([k]) => k !== bId)) } : p)),
+      invoices: s.invoices.filter((i) => i.branchId !== bId),
+      lots: s.lots.filter((l) => l.branchId !== bId),
+      mermas: s.mermas.filter((m) => m.branchId !== bId),
+      physicalInventories: s.physicalInventories.filter((pi) => pi.branchId !== bId),
+      inventoryAdjustments: (s.inventoryAdjustments || []).filter((a) => a.branchId !== bId),
+      users: s.users.map((u) => (u.branchId === bId ? { ...u, status: "disabled" } : u)),
+    }));
+    audit("Sucursales", `Eliminó permanentemente la sucursal ${deleteTarget.name} y todos sus registros asociados (facturas, inventarios, mermas, ajustes)`);
+    setDeleteTarget(null); setDeleteConfirmText("");
+  };
   const exportRows = state.branches.map((b) => ({ Número: b.number, Sucursal: b.name, Estado: b.status === "active" ? "Activa" : "Desactivada" }));
   return (
     <div>
@@ -1188,6 +1436,7 @@ function BranchesView({ state, mutate, audit }) {
             <div style={{ display: "flex", gap: 6, marginTop: 14 }}>
               <Btn small variant="secondary" icon={Pencil} onClick={() => setForm(b)}>Editar</Btn>
               <Btn small variant="danger" icon={Ban} onClick={() => toggle(b)}>{b.status === "active" ? "Desactivar" : "Reactivar"}</Btn>
+              <Btn small variant="danger" icon={Trash2} onClick={() => setDeleteTarget(b)}>Eliminar</Btn>
             </div>
           </Card>
         ))}
@@ -1207,6 +1456,18 @@ function BranchesView({ state, mutate, audit }) {
               <Btn variant="ghost" onClick={() => setForm(null)}>Cancelar</Btn>
               <Btn onClick={() => form.name.trim() && save(form)}>Guardar</Btn>
             </div>
+          </div>
+        </Modal>
+      )}
+      {deleteTarget && (
+        <Modal title={`Eliminar "${deleteTarget.name}" permanentemente`} onClose={() => { setDeleteTarget(null); setDeleteConfirmText(""); }} width={420}>
+          <p style={{ fontSize: 13, color: T.red, fontWeight: 600, marginTop: 0 }}>Esta acción no se puede deshacer. Se eliminarán para siempre la sucursal y todos sus registros: facturas, inventarios físicos, ajustes, mermas y existencias. Los usuarios asignados a esta sucursal quedarán desactivados.</p>
+          <Field label={`Para confirmar, escribe el nombre exacto: ${deleteTarget.name}`}>
+            <TextInput value={deleteConfirmText} onChange={(e) => setDeleteConfirmText(e.target.value)} />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+            <Btn variant="ghost" onClick={() => { setDeleteTarget(null); setDeleteConfirmText(""); }}>Cancelar</Btn>
+            <Btn variant="danger" disabled={deleteConfirmText.trim() !== deleteTarget.name} icon={Trash2} onClick={doDelete}>Eliminar permanentemente</Btn>
           </div>
         </Modal>
       )}
@@ -1824,6 +2085,13 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
     setCancelTarget(null); setCancelReason("");
   };
 
+  const doRecalcFolios = () => {
+    if (!branchId) return;
+    const folioById = recalcBranchFolios(state, branchId);
+    mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (folioById[pi.id] ? { ...pi, folio: folioById[pi.id] } : pi)) }));
+    audit("Inventario físico", `Recalculó los folios de los inventarios de ${state.branches.find((b) => b.id === branchId)?.name}`);
+  };
+
   const exportRows = list.map((pi) => ({
     Folio: pi.folio, Fecha: fmtDate(pi.date), Tipo: INV_TYPES[pi.type] || "Inventario Físico",
     Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
@@ -1846,7 +2114,10 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
             <ExportBar rows={exportRows} label="inventarios físicos" />
             <TextInput placeholder="Buscar por folio…" value={folioSearch} onChange={(e) => setFolioSearch(e.target.value)} style={{ width: 180 }} />
           </div>
-          <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {isGeneral && branchId && <Btn small variant="secondary" icon={CheckCircle2} onClick={doRecalcFolios}>Recalcular folios de esta sucursal</Btn>}
+            <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
+          </div>
         </div>
         {!branchId && <div style={{ color: T.red, fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Selecciona una sucursal para crear un inventario.</div>}
       </Card>
@@ -2451,15 +2722,27 @@ function SuggestedOrdersView({ state, branches, activeBranchId, currentUser }) {
 const REPORT_TYPES = [
   "Existencias actuales", "Productos próximos a caducar", "Mermas por caducidad", "Facturas pendientes de pago",
   "Facturas pagadas", "Consumo por sucursal", "Compras por proveedor", "Comparativo de consumo entre sucursales",
-  "Historial de pedidos sugeridos",
+  "Historial de pedidos sugeridos", "Comparativo de inventario físico", "Impacto de inventario físico", "Histórico de inventarios físicos",
 ];
 function ReportsView({ state, branches }) {
   const [type, setType] = useState(REPORT_TYPES[0]);
   const [branchFilter, setBranchFilter] = useState("all");
 
   let rows = [];
+  let summary = null;
   if (type === "Existencias actuales") {
-    rows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ Producto: p.name, Sucursal: b.name, "Existencia (pz)": theoreticalStock(state.lots, p.id, b.id) })));
+    rows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => {
+      const existencia = theoreticalStock(state.lots, p.id, b.id);
+      const costoUnitario = weightedUnitCost(state.lots, p.id, b.id);
+      return { Producto: p.name, Categoría: p.category || "—", Sucursal: b.name, "Existencia actual": existencia, "Unidad de medida": "Piezas", "Costo unitario": fmtMoney(costoUnitario), "Costo total": fmtMoney(existencia * costoUnitario) };
+    }));
+    const existRows = state.products.filter((p) => p.status === "active").flatMap((p) => branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ qty: theoreticalStock(state.lots, p.id, b.id), cost: weightedUnitCost(state.lots, p.id, b.id) })));
+    summary = [
+      { label: "Productos activos", value: state.products.filter((p) => p.status === "active").length },
+      { label: "Valor total del inventario", value: fmtMoney(existRows.reduce((s, r) => s + r.qty * r.cost, 0)) },
+      { label: "Con existencia", value: existRows.filter((r) => r.qty > 0).length },
+      { label: "Sin existencia / crítica (≤5 pz)", value: existRows.filter((r) => r.qty <= 5).length },
+    ];
   } else if (type === "Productos próximos a caducar") {
     rows = state.lots.filter((l) => l.status === "active" && l.expirationDate && l.remainingPieces > 0 && (branchFilter === "all" || l.branchId === branchFilter) && ["yellow", "orange", "red"].includes(semaphoreLevel(l.expirationDate, state.config)))
       .map((l) => ({ Producto: state.products.find((p) => p.id === l.productId)?.name, Sucursal: state.branches.find((b) => b.id === l.branchId)?.name, Caducidad: fmtDate(l.expirationDate), Piezas: l.remainingPieces, Nivel: SEM_META[semaphoreLevel(l.expirationDate, state.config)].label }));
@@ -2474,6 +2757,35 @@ function ReportsView({ state, branches }) {
     rows = state.suppliers.map((s) => ({ Proveedor: s.name, "Total comprado": fmtMoney(state.invoices.filter((i) => i.supplierId === s.id && i.status !== "cancelled" && (branchFilter === "all" || i.branchId === branchFilter)).reduce((sum, i) => sum + i.total, 0)) }));
   } else if (type === "Historial de pedidos sugeridos") {
     rows = state.physicalInventories.filter((pi) => branchFilter === "all" || pi.branchId === branchFilter).flatMap((pi) => pi.suggestedOrder.map((o) => ({ Folio: pi.folio, Fecha: fmtDate(pi.date), Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name, Producto: o.productName, "Piezas sugeridas": o.neededPieces })));
+  } else if (type === "Comparativo de inventario físico") {
+    const invs = state.physicalInventories.filter((pi) => isInventoryFinal(pi) && (branchFilter === "all" || pi.branchId === branchFilter));
+    rows = invs.flatMap((pi) => (pi.counts || []).filter((c) => c.theoretical != null).map((c) => ({
+      Folio: pi.folio, Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—", Producto: state.products.find((p) => p.id === c.productId)?.name || "—",
+      "Existencia teórica": c.theoretical, "Existencia física": c.total, Diferencia: c.difference, "Costo unitario": fmtMoney(c.unitCost || 0), "Costo de la diferencia": fmtMoney(c.diffCost || 0), "% Variación": `${(c.diffPercent || 0).toFixed(1)}%`,
+    })));
+  } else if (type === "Impacto de inventario físico") {
+    const invs = state.physicalInventories.filter((pi) => isInventoryFinal(pi) && (branchFilter === "all" || pi.branchId === branchFilter) && pi.faltantes != null);
+    rows = invs.map((pi) => ({
+      Folio: pi.folio, Fecha: fmtDate(pi.date), Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
+      "Faltantes (pz)": pi.faltantes, "Sobrantes (pz)": pi.sobrantes, "Valor de faltantes": fmtMoney(pi.valorFaltantes), "Valor de sobrantes": fmtMoney(pi.valorSobrantes),
+      "Diferencia económica neta": fmtMoney(pi.impactoNeto), "Ajustes generados": (state.inventoryAdjustments || []).filter((a) => a.inventoryId === pi.id).length,
+    }));
+    summary = [
+      { label: "Inventarios con impacto", value: invs.length },
+      { label: "Valor de faltantes", value: fmtMoney(invs.reduce((s, pi) => s + (pi.valorFaltantes || 0), 0)) },
+      { label: "Valor de sobrantes", value: fmtMoney(invs.reduce((s, pi) => s + (pi.valorSobrantes || 0), 0)) },
+      { label: "Diferencia económica neta", value: fmtMoney(invs.reduce((s, pi) => s + (pi.impactoNeto || 0), 0)) },
+    ];
+  } else if (type === "Histórico de inventarios físicos") {
+    rows = state.physicalInventories.filter((pi) => branchFilter === "all" || pi.branchId === branchFilter)
+      .sort((a, b) => (b.createdAt?.date || b.date).localeCompare(a.createdAt?.date || a.date))
+      .map((pi) => ({
+        Folio: pi.folio, Fecha: fmtDate(pi.date), Tipo: INV_TYPES[pi.type] || "Inventario Físico", Sucursal: state.branches.find((b) => b.id === pi.branchId)?.name || "—",
+        Responsable: (pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", "), "Productos contados": (pi.counts || []).length,
+        Diferencias: (pi.counts || []).filter((c) => c.difference).length, "Impacto económico": pi.impactoNeto != null ? fmtMoney(pi.impactoNeto) : "—",
+        "Ajustes generados": (state.inventoryAdjustments || []).filter((a) => a.inventoryId === pi.id).length,
+        Estado: pi.status === "cancelado" ? "Cancelado" : isInventoryOpen(pi) ? "En proceso" : "Finalizado",
+      }));
   }
 
   return (
@@ -2485,6 +2797,11 @@ function ReportsView({ state, branches }) {
         </Select>
         <ExportBar rows={rows} label={type} />
       </div>
+      {summary && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 14 }}>
+          {summary.map((s, i) => <KpiCard key={i} label={s.label} value={s.value} accent={i % 2 === 0 ? T.green700 : T.orange} />)}
+        </div>
+      )}
       <Card style={{ padding: 0, overflow: "auto" }}>
         <div style={{ padding: "14px 16px 0" }}>
           <h4 style={{ margin: 0, fontFamily: "'Space Grotesk',sans-serif" }}>{type}</h4>
@@ -2527,7 +2844,45 @@ function AuditLogView({ state }) {
 function ConfigView({ state, mutate, audit, onReset }) {
   const [cfg, setCfg] = useState(state.config);
   const [confirmingReset, setConfirmingReset] = useState(false);
+  const [restoreFile, setRestoreFile] = useState(null);
+  const [restoreError, setRestoreError] = useState("");
+  const fileInputRef = useRef(null);
   const save = () => { mutate((s) => ({ ...s, config: cfg })); audit("Configuración", "Actualizó los parámetros generales del sistema"); };
+
+  const downloadBackup = () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `subgestor-respaldo-${todayISO()}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    audit("Configuración", "Descargó un respaldo completo de los datos");
+  };
+
+  const onPickFile = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    setRestoreError("");
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!Array.isArray(parsed.users) || !Array.isArray(parsed.branches) || !Array.isArray(parsed.products)) {
+          setRestoreError("Este archivo no parece un respaldo válido de SubGestor.");
+          return;
+        }
+        setRestoreFile(parsed);
+      } catch (e2) { setRestoreError("No se pudo leer el archivo — asegúrate de que sea el .json exportado desde aquí mismo."); }
+    };
+    reader.readAsText(file);
+  };
+
+  const doRestore = () => {
+    mutate(() => restoreFile);
+    audit("Configuración", "Restauró los datos desde un archivo de respaldo");
+    setRestoreFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 480 }}>
       <Card>
@@ -2555,6 +2910,16 @@ function ConfigView({ state, mutate, audit, onReset }) {
           <Btn icon={CheckCircle2} onClick={save}>Guardar configuración</Btn>
         </div>
       </Card>
+      <Card style={{ borderTop: `3px solid ${T.green700}` }}>
+        <div style={{ fontSize: 12.5, fontWeight: 700, color: T.green700, marginBottom: 4 }}>Respaldo de datos</div>
+        <p style={{ fontSize: 12, color: T.gray500, marginTop: 0 }}>Descarga una copia completa de todos los datos (productos, facturas, inventarios, usuarios, todo) en un archivo. Guárdalo en un lugar seguro — recomendamos hacerlo periódicamente, ya que este plan no genera respaldos automáticos.</p>
+        <Btn variant="secondary" icon={Download} onClick={downloadBackup}>Descargar respaldo completo</Btn>
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: T.ink, marginBottom: 6 }}>Restaurar desde un respaldo</div>
+          <input ref={fileInputRef} type="file" accept="application/json" onChange={onPickFile} style={{ fontSize: 12 }} />
+          {restoreError && <div style={{ color: T.red, fontSize: 12, marginTop: 6 }}>{restoreError}</div>}
+        </div>
+      </Card>
       <Card style={{ borderTop: `3px solid ${T.red}` }}>
         <div style={{ fontSize: 12.5, fontWeight: 700, color: T.red, marginBottom: 4 }}>Zona de riesgo</div>
         <p style={{ fontSize: 12, color: T.gray500, marginTop: 0 }}>Borra todos los datos compartidos (productos, proveedores, facturas, inventarios, usuarios) y restaura la configuración inicial de la prueba.</p>
@@ -2566,6 +2931,16 @@ function ConfigView({ state, mutate, audit, onReset }) {
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
             <Btn variant="ghost" onClick={() => setConfirmingReset(false)}>Cancelar</Btn>
             <Btn variant="danger" icon={RotateCcw} onClick={() => { setConfirmingReset(false); onReset(); }}>Restablecer datos</Btn>
+          </div>
+        </Modal>
+      )}
+      {restoreFile && (
+        <Modal title="Restaurar desde respaldo" onClose={() => { setRestoreFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }} width={420}>
+          <p style={{ fontSize: 13, color: T.red, fontWeight: 600, marginTop: 0 }}>Esto reemplazará TODOS los datos actuales (productos, facturas, inventarios, usuarios) con lo que hay en el archivo. Lo que exista ahora mismo y no esté en el respaldo se perderá.</p>
+          <p style={{ fontSize: 12.5, color: T.gray500 }}>El archivo contiene {restoreFile.branches?.length || 0} sucursal(es), {restoreFile.products?.length || 0} producto(s) e {restoreFile.invoices?.length || 0} factura(s).</p>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn variant="ghost" onClick={() => { setRestoreFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }}>Cancelar</Btn>
+            <Btn variant="danger" icon={CheckCircle2} onClick={doRestore}>Restaurar este respaldo</Btn>
           </div>
         </Modal>
       )}
@@ -2586,17 +2961,21 @@ function SubGestorAppInner() {
 
   useEffect(() => {
     let cancelled = false;
-    const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), 4000));
     (async () => {
       try {
-        const loaded = await Promise.race([loadState(), timeout]);
+        const result = await loadState();
         if (cancelled) return;
-        if (loaded && loaded !== "timeout") {
-          setState(loaded);
-        } else {
-          // No hay datos compartidos previos (o el almacenamiento tardó demasiado):
-          // se conserva y persiste la semilla local para esta sesión.
+        if (result.status === "found" && result.data) {
+          setState(result.data);
+        } else if (result.status === "empty") {
+          // Se confirmó que genuinamente no hay datos remotos todavía
+          // (primera vez real) — recién ahí es seguro guardar la semilla.
           saveState(seedRef.current);
+        } else {
+          // Error de conexión: NUNCA se sobrescriben los datos remotos por
+          // esto. Se muestra la semilla solo localmente en lo que se puede
+          // reintentar (el botón "Actualizar" y el sondeo automático).
+          console.error("No se pudo sincronizar con el almacenamiento compartido; no se modificó nada en la nube.");
         }
       } catch (e) {
         console.error("No se pudo sincronizar con el almacenamiento compartido", e);
@@ -2624,8 +3003,8 @@ function SubGestorAppInner() {
     if (pendingSave.current) return; // evita pisar un cambio local que aún no se ha guardado
     setSyncing(true);
     try {
-      const loaded = await loadState();
-      if (loaded) setState(loaded);
+      const result = await loadState();
+      if (result.status === "found" && result.data) setState(result.data);
     } catch (e) { /* noop */ }
     setSyncing(false);
   }, []);
