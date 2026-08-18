@@ -2087,11 +2087,13 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
     setCancelTarget(null); setCancelReason("");
   };
 
+  const [showRecalcConfirm, setShowRecalcConfirm] = useState(false);
   const doRecalcFolios = () => {
     if (!branchId) return;
     const folioById = recalcBranchFolios(state, branchId);
     mutate((s) => ({ ...s, physicalInventories: s.physicalInventories.map((pi) => (folioById[pi.id] ? { ...pi, folio: folioById[pi.id] } : pi)) }));
     audit("Inventario físico", `Recalculó los folios de los inventarios de ${state.branches.find((b) => b.id === branchId)?.name}`);
+    setShowRecalcConfirm(false);
   };
 
   const exportRows = list.map((pi) => ({
@@ -2117,7 +2119,7 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
             <TextInput placeholder="Buscar por folio…" value={folioSearch} onChange={(e) => setFolioSearch(e.target.value)} style={{ width: 180 }} />
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {isGeneral && branchId && <Btn small variant="secondary" icon={CheckCircle2} onClick={doRecalcFolios}>Recalcular folios de esta sucursal</Btn>}
+            {isGeneral && branchId && <Btn small variant="secondary" icon={CheckCircle2} onClick={() => setShowRecalcConfirm(true)}>Recalcular folios de esta sucursal</Btn>}
             <Btn icon={Plus} onClick={() => setShowCreate(true)} disabled={!branchId}>Nuevo inventario</Btn>
           </div>
         </div>
@@ -2146,6 +2148,15 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
         {!list.length && <EmptyState text="No hay inventarios físicos registrados." />}
       </Card>
       {showCreate && <InventoryCreateModal state={state} branchId={branchId} currentUser={currentUser} onCreate={createInventory} onClose={() => setShowCreate(false)} />}
+      {showRecalcConfirm && (
+        <Modal title="Recalcular folios de esta sucursal" onClose={() => setShowRecalcConfirm(false)} width={420}>
+          <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>Esto vuelve a numerar el folio de <b>todos</b> los inventarios de {state.branches.find((b) => b.id === branchId)?.name}, en el orden en que se crearon, usando el prefijo actual de la sucursal. No cambia ningún otro dato (cantidades, diferencias, ajustes) — solo la etiqueta del folio.</p>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn variant="ghost" onClick={() => setShowRecalcConfirm(false)}>Cancelar</Btn>
+            <Btn icon={CheckCircle2} onClick={doRecalcFolios}>Sí, recalcular folios</Btn>
+          </div>
+        </Modal>
+      )}
       {cancelTarget && (
         <Modal title={`Cancelar inventario ${cancelTarget.folio}`} onClose={() => setCancelTarget(null)} width={400}>
           <p style={{ fontSize: 13, color: T.gray500, marginTop: 0 }}>El inventario se conserva en el historial, solo cambia su estado.</p>
