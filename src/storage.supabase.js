@@ -45,7 +45,7 @@ export const supabase = CONFIGURED ? createClient(SUPABASE_URL, SUPABASE_ANON_KE
 const ROW_ID = "main";
 
 export async function loadState() {
-  if (!supabase) return null;
+  if (!supabase) return { status: "error", data: null };
   try {
     const { data, error } = await supabase
       .from("subgestor_state")
@@ -53,10 +53,11 @@ export async function loadState() {
       .eq("id", ROW_ID)
       .maybeSingle();
     if (error) throw error;
-    return data?.data || null;
+    if (data && data.data) return { status: "found", data: data.data };
+    return { status: "empty", data: null };
   } catch (e) {
     console.error("No se pudo leer de Supabase", e);
-    return null;
+    return { status: "error", data: null };
   }
 }
 
