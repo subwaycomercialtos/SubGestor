@@ -1242,12 +1242,54 @@ function DashboardGeneralTab({ state, activeBranchId, role, onGoToMermas }) {
 }
 
 /* ============================== PRODUCTOS ============================== */
+/* Compara, para un producto, el costo más reciente registrado con cada uno
+   de sus proveedores asociados — para facilitar decidir a quién comprarle.
+   Ordenado del más barato al más caro (los que no tienen historial van al
+   final). */
+function computeSupplierComparison(product, state) {
+  const supplierIds = product.supplierIds && product.supplierIds.length ? product.supplierIds : [product.supplierId];
+  const rows = supplierIds.filter(Boolean).map((sid) => {
+    const supplier = state.suppliers.find((s) => s.id === sid);
+    const history = (product.costHistory || []).filter((h) => h.supplierId === sid).sort((a, b) => a.date.localeCompare(b.date));
+    const last = history[history.length - 1];
+    return {
+      supplierId: sid, supplierName: supplier?.name || "—", isPrimary: sid === product.supplierId,
+      lastCost: last ? last.costPerPackage : null, lastDate: last ? last.date : null, historyCount: history.length,
+    };
+  });
+  return rows.sort((a, b) => (a.lastCost ?? Infinity) - (b.lastCost ?? Infinity));
+}
+
 const KARDEX_TYPE_META = {
   entrada: { fg: T.green700, bg: T.green100 },
   merma: { fg: T.red, bg: "#FBDCDA" },
   salida: { fg: T.orange, bg: "#FDE6D2" },
   ajuste: { fg: T.green700, bg: T.green100 },
 };
+
+function SupplierComparisonModal({ product, state, onClose }) {
+  const rows = computeSupplierComparison(product, state);
+  const cheapest = rows.find((r) => r.lastCost != null);
+  return (
+    <Modal title={`Comparar proveedores — ${product.name}`} onClose={onClose} width={560}>
+      {rows.length <= 1 && <p style={{ fontSize: 12.5, color: T.gray500, marginTop: 0 }}>Este producto todavía solo está asociado a un proveedor. Puedes agregar más desde "Editar producto".</p>}
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr><Th>Proveedor</Th><Th>Último costo</Th><Th>Fecha</Th><Th>Compras registradas</Th><Th></Th></tr></thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.supplierId}>
+              <Td><b>{r.supplierName}</b>{r.isPrimary && <span style={{ fontSize: 10.5, color: T.gray500 }}> (principal)</span>}</Td>
+              <Td>{r.lastCost != null ? fmtMoney(r.lastCost) : "Sin compras aún"}</Td>
+              <Td>{r.lastDate ? fmtDate(r.lastDate) : "—"}</Td>
+              <Td>{r.historyCount}</Td>
+              <Td>{cheapest && r.supplierId === cheapest.supplierId && <Pill bg={T.green100} fg={T.green700}>Más barato</Pill>}</Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Modal>
+  );
+}
 
 function KardexModal({ state, productId, branches, activeBranchId, onClose }) {
   const [branchId, setBranchId] = useState(activeBranchId || branches[0]?.id || "");
@@ -1295,7 +1337,9 @@ function KardexModal({ state, productId, branches, activeBranchId, onClose }) {
 }
 
 function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
-  const [f, setF] = useState(initial || { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", code: "", category: "", notes: "", image: null, idealStock: {} });
+  const [f, setF] = useState(() => initial
+    ? { ...initial, supplierIds: initial.supplierIds && initial.supplierIds.length ? initial.supplierIds : [initial.supplierId] }
+    : { name: "", piecesPerPackage: 1, supplierId: suppliers[0]?.id || "", supplierIds: suppliers[0] ? [suppliers[0].id] : [], code: "", category: "", notes: "", image: null, idealStock: {} });
   const [formError, setFormError] = useState("");
   const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const onImg = (e) => {
@@ -1304,7 +1348,8 @@ function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
   };
   const handleSave = () => {
     if (!f.name.trim() || !f.code.trim() || !(f.piecesPerPackage > 0)) { setFormError("Completa nombre, código y piezas por paquete (mayor que cero)."); return; }
-    const err = onSave(f);
+    const supplierIds = Array.from(new Set([f.supplierId, ...(f.supplierIds || [])]));
+    const err = onSave({ ...f, supplierIds });
     if (err) setFormError(err);
   };
   return (
@@ -1316,10 +1361,22 @@ function ProductForm({ initial, suppliers, branches, onSave, onClose }) {
           <Field label="Código de producto"><TextInput value={f.code} onChange={(e) => set("code", e.target.value)} /></Field>
         </div>
         <Field label="Categoría (opcional)"><TextInput value={f.category || ""} onChange={(e) => set("category", e.target.value)} placeholder="Ej. Bebidas, Lácteos, Abarrotes…" /></Field>
-        <Field label="Proveedor">
+        <Field label="Proveedor principal" hint="El que se usa como referencia para el costo sugerido cuando no hay historial con otro proveedor.">
           <Select value={f.supplierId} onChange={(e) => set("supplierId", e.target.value)}>
             {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </Select>
+        </Field>
+        <Field label="Proveedores adicionales (opcional)" hint="Marca otros proveedores a los que también le puedes comprar este producto, para comparar precios.">
+          <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, padding: 8, maxHeight: 140, overflow: "auto" }}>
+            {suppliers.filter((s) => s.id !== f.supplierId).map((s) => (
+              <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, padding: "3px 0", cursor: "pointer" }}>
+                <input type="checkbox" checked={(f.supplierIds || []).includes(s.id)}
+                  onChange={(e) => set("supplierIds", e.target.checked ? [...(f.supplierIds || []), s.id] : (f.supplierIds || []).filter((id) => id !== s.id))} />
+                {s.name}
+              </label>
+            ))}
+            {suppliers.length <= 1 && <div style={{ fontSize: 12, color: T.gray500 }}>Da de alta otro proveedor para poder agregarlo aquí.</div>}
+          </div>
         </Field>
         <Field label="Stock ideal por sucursal (piezas)">
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1354,6 +1411,7 @@ function ProductsView({ state, mutate, branches, activeBranchId, currentUser, au
   const [editing, setEditing] = useState(null); const [showForm, setShowForm] = useState(false);
   const [unit, setUnit] = useState("piezas");
   const [kardexProductId, setKardexProductId] = useState(null);
+  const [compareProduct, setCompareProduct] = useState(null);
 
   const list = state.products.filter((p) =>
     (supplierFilter === "all" || p.supplierId === supplierFilter) &&
@@ -1426,6 +1484,7 @@ function ProductsView({ state, mutate, branches, activeBranchId, currentUser, au
                       <button onClick={() => { setEditing(p); setShowForm(true); }} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Pencil size={13} /></button>
                       <button onClick={() => toggleStatus(p)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Ban size={13} color={p.status === "active" ? T.red : T.green700} /></button>
                       <Btn small variant="secondary" onClick={() => setKardexProductId(p.id)}>Kardex</Btn>
+                      {(p.supplierIds && p.supplierIds.length > 1) && <Btn small variant="secondary" onClick={() => setCompareProduct(p)}>Comparar proveedores</Btn>}
                     </div>
                   </Td>
                 </tr>
@@ -1437,6 +1496,7 @@ function ProductsView({ state, mutate, branches, activeBranchId, currentUser, au
       </Card>
       {showForm && <ProductForm initial={editing} suppliers={state.suppliers.filter((s) => s.status === "active")} branches={branches} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
       {kardexProductId && <KardexModal state={state} productId={kardexProductId} branches={branches} activeBranchId={activeBranchId} onClose={() => setKardexProductId(null)} />}
+      {compareProduct && <SupplierComparisonModal product={compareProduct} state={state} onClose={() => setCompareProduct(null)} />}
     </div>
   );
 }
@@ -1677,15 +1737,19 @@ function InvoiceForm({ state, branchId, initial, onSave, onClose }) {
     invoiceNumber: "", supplierId: state.suppliers[0]?.id || "", branchId, issueDate: todayISO(), entryDate: todayISO(),
     items: [], total: 0, status: "pending",
   });
-  const products = state.products.filter((p) => p.status === "active" && p.supplierId === f.supplierId);
+  const products = state.products.filter((p) => p.status === "active" && (p.supplierIds && p.supplierIds.length ? p.supplierIds.includes(f.supplierId) : p.supplierId === f.supplierId));
+  const lastCostForSupplier = (productId, supplierId) => {
+    const prod = state.products.find((p) => p.id === productId);
+    const fromHistory = (prod?.costHistory || []).filter((h) => h.supplierId === supplierId).slice(-1)[0];
+    return fromHistory ? fromHistory.costPerPackage : prod?.lastCostPerPackage || 0;
+  };
   const addItem = () => {
     const defaultProduct = products[0];
-    setF((s) => ({ ...s, items: [...s.items, { id: uid("it"), productId: defaultProduct?.id || "", packages: 1, looseUnits: 0, costPerPackage: defaultProduct?.lastCostPerPackage || 0, expirationDate: "" }] }));
+    setF((s) => ({ ...s, items: [...s.items, { id: uid("it"), productId: defaultProduct?.id || "", packages: 1, looseUnits: 0, costPerPackage: defaultProduct ? lastCostForSupplier(defaultProduct.id, f.supplierId) : 0, expirationDate: "" }] }));
   };
   const updateItem = (id, patch) => setF((s) => ({ ...s, items: s.items.map((it) => (it.id === id ? { ...it, ...patch } : it)) }));
   const onProductChange = (id, productId) => {
-    const prod = state.products.find((p) => p.id === productId);
-    updateItem(id, { productId, costPerPackage: prod?.lastCostPerPackage || 0 });
+    updateItem(id, { productId, costPerPackage: lastCostForSupplier(productId, f.supplierId) });
   };
   const removeItem = (id) => setF((s) => ({ ...s, items: s.items.filter((it) => it.id !== id) }));
   const lineTotal = (it, prod) => it.packages * it.costPerPackage + (it.looseUnits || 0) * (prod ? it.costPerPackage / prod.piecesPerPackage : 0);
@@ -1734,7 +1798,7 @@ function InvoiceForm({ state, branchId, initial, onSave, onClose }) {
                       <button onClick={() => removeItem(it.id)} style={{ border: "none", background: "#fff", borderRadius: 6, padding: 5, cursor: "pointer" }}><Trash2 size={13} color={T.red} /></button>
                     </div>
                     {prod && <div style={{ fontSize: 11, color: T.gray500, marginTop: 4, paddingLeft: 2 }}>= {totalPieces} piezas totales · {fmtMoney(lineTotal(it, prod))}
-                      {prod.lastCostPerPackage != null && <span> · último costo registrado: {fmtMoney(prod.lastCostPerPackage)}/paq</span>}
+                      {lastCostForSupplier(prod.id, f.supplierId) > 0 && <span> · último costo con este proveedor: {fmtMoney(lastCostForSupplier(prod.id, f.supplierId))}/paq</span>}
                     </div>}
                   </div>
                 );
@@ -1776,7 +1840,7 @@ function InvoicesView({ state, mutate, branches, activeBranchId, currentUser, au
         ...s,
         invoices: s.invoices.map((i) => (i.id === f.id ? { ...f, editedBy: currentUser.name, editedAt: nowStamp() } : i)),
         lots: [...s.lots.filter((l) => l.invoiceId !== f.id), ...newLots],
-        products: s.products.map((p) => (lastCostByProduct[p.id] != null ? { ...p, lastCostPerPackage: lastCostByProduct[p.id], costHistory: [...(p.costHistory || []), { date: costDate, costPerPackage: lastCostByProduct[p.id], invoiceNumber: f.invoiceNumber }] } : p)),
+        products: s.products.map((p) => (lastCostByProduct[p.id] != null ? { ...p, lastCostPerPackage: lastCostByProduct[p.id], costHistory: [...(p.costHistory || []), { date: costDate, costPerPackage: lastCostByProduct[p.id], invoiceNumber: f.invoiceNumber, supplierId: f.supplierId }] } : p)),
       }));
       audit("Facturas", `Editó la factura ${f.invoiceNumber} (los lotes asociados se restablecieron)`);
     } else {
@@ -1784,7 +1848,7 @@ function InvoicesView({ state, mutate, branches, activeBranchId, currentUser, au
         ...s,
         invoices: [...s.invoices, { ...f, id: invId, createdBy: currentUser.name, createdAt: nowStamp() }],
         lots: [...s.lots, ...newLots],
-        products: s.products.map((p) => (lastCostByProduct[p.id] != null ? { ...p, lastCostPerPackage: lastCostByProduct[p.id], costHistory: [...(p.costHistory || []), { date: costDate, costPerPackage: lastCostByProduct[p.id], invoiceNumber: f.invoiceNumber }] } : p)),
+        products: s.products.map((p) => (lastCostByProduct[p.id] != null ? { ...p, lastCostPerPackage: lastCostByProduct[p.id], costHistory: [...(p.costHistory || []), { date: costDate, costPerPackage: lastCostByProduct[p.id], invoiceNumber: f.invoiceNumber, supplierId: f.supplierId }] } : p)),
       }));
       audit("Facturas", `Registró la factura ${f.invoiceNumber} (${fmtMoney(f.total)})`);
     }
