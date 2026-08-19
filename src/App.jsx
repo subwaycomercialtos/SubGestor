@@ -324,6 +324,74 @@ function hasNearbyMerma(state, productId, branchId, date) {
    como "consumo", ya que son el mismo movimiento de inventario visto desde
    otro ángulo). Se muestra del más reciente al más antiguo, con la
    existencia resultante después de cada movimiento. */
+const ALERT_PRIORITY_META = {
+  alta: { bg: "#FBDCDA", fg: T.red, label: "Alta", weight: 3 },
+  media: { bg: "#FDE6D2", fg: T.orange, label: "Media", weight: 2 },
+  baja: { bg: "#FDF3D0", fg: T.yellow600, label: "Baja", weight: 1 },
+};
+
+/* Central de Alertas: reúne en una sola lista las señales que ya calculan
+   otros módulos (caducidad, mermas, inventario físico, pedidos) y suma las
+   que todavía no existían (stock bajo/agotado, variación de costos), cada
+   una con su prioridad y el módulo del que viene. No inventa nada nuevo
+   sobre los datos — solo los junta y los prioriza. */
+function computeCentralAlerts(state, branchIds) {
+  const alerts = [];
+  const push = (priority, module, title, detail) => alerts.push({ priority, module, title, detail });
+
+  branchIds.forEach((branchId) => {
+    const branch = state.branches.find((b) => b.id === branchId);
+    const bname = branch?.name || "—";
+
+    // Stock bajo o agotado
+    state.products.filter((p) => p.status === "active" && p.idealStock && p.idealStock[branchId] > 0).forEach((p) => {
+      const stock = theoreticalStock(state.lots, p.id, branchId);
+      const ideal = p.idealStock[branchId];
+      if (stock <= 0) push("alta", "Inventario", `${p.name} sin existencia`, `${bname} — se agotó, el ideal es ${ideal} pz.`);
+      else if (stock < ideal * 0.3) push("media", "Inventario", `${p.name} con stock bajo`, `${bname} — quedan ${stock} pz de un ideal de ${ideal}.`);
+    });
+
+    // Productos próximos a caducar
+    state.lots.filter((l) => l.branchId === branchId && l.status === "active" && l.remainingPieces > 0 && l.expirationDate).forEach((l) => {
+      const level = semaphoreLevel(l.expirationDate, state.config);
+      if (level === "red") push("alta", "Caducidad", `${state.products.find((p) => p.id === l.productId)?.name || "—"} por caducar`, `${bname} — caduca el ${fmtDate(l.expirationDate)} (${l.remainingPieces} pz).`);
+      else if (level === "orange") push("media", "Caducidad", `${state.products.find((p) => p.id === l.productId)?.name || "—"} próximo a caducar`, `${bname} — caduca el ${fmtDate(l.expirationDate)} (${l.remainingPieces} pz).`);
+    });
+
+    // Mermas anómalas
+    const mermaStatus = computeMermaStandardStatus(state, branchId, state.config.mermaPeriod || "mensual");
+    if (mermaStatus.estado === "anomala") push("alta", "Mermas", `${bname}: merma por encima del estándar`, `${mermaStatus.realPercent.toFixed(1)}% real contra ${mermaStatus.standard}% máximo.`);
+    else if (mermaStatus.estado === "advertencia") push("media", "Mermas", `${bname}: merma cerca del límite`, `${mermaStatus.realPercent.toFixed(1)}% real contra ${mermaStatus.standard}% máximo.`);
+
+    // Diferencias significativas en inventarios físicos
+    const lastInv = state.physicalInventories.filter((pi) => pi.branchId === branchId && isInventoryFinal(pi))
+      .sort((a, b) => (b.createdAt?.date || b.date).localeCompare(a.createdAt?.date || a.date))[0];
+    if (lastInv) {
+      if (lastInv.requiresAuthorization && !lastInv.authorized) push("alta", "Inventario físico", `${bname}: inventario pendiente de autorización`, `${lastInv.folio} tuvo diferencias significativas sin autorizar.`);
+      else {
+        const sigCount = (lastInv.counts || []).filter((c) => c.diffLevel === "diferencia_significativa").length;
+        if (sigCount > 0) push("media", "Inventario físico", `${bname}: diferencias significativas`, `${lastInv.folio} — ${sigCount} producto(s) con diferencia significativa.`);
+      }
+    }
+
+    // Pedidos sugeridos
+    const suggested = computeSuggestedOrders(state, branchId);
+    if (suggested.length > 0) push("baja", "Pedidos sugeridos", `${bname}: ${suggested.length} producto(s) por pedir`, suggested.slice(0, 3).map((o) => o.productName).join(", ") + (suggested.length > 3 ? "…" : ""));
+  });
+
+  // Variación importante de costos (no depende de una sucursal en particular)
+  state.products.filter((p) => p.status === "active" && (p.costHistory || []).length >= 2).forEach((p) => {
+    const hist = [...p.costHistory].sort((a, b) => a.date.localeCompare(b.date));
+    const prev = hist[hist.length - 2], last = hist[hist.length - 1];
+    if (!prev.costPerPackage) return;
+    const pct = ((last.costPerPackage - prev.costPerPackage) / prev.costPerPackage) * 100;
+    if (Math.abs(pct) >= 30) push("alta", "Compras", `${p.name}: costo cambió mucho`, `${pct > 0 ? "Subió" : "Bajó"} ${Math.abs(pct).toFixed(1)}% — de ${fmtMoney(prev.costPerPackage)} a ${fmtMoney(last.costPerPackage)} por paquete.`);
+    else if (Math.abs(pct) >= 15) push("media", "Compras", `${p.name}: variación de costo`, `${pct > 0 ? "Subió" : "Bajó"} ${Math.abs(pct).toFixed(1)}% — de ${fmtMoney(prev.costPerPackage)} a ${fmtMoney(last.costPerPackage)} por paquete.`);
+  });
+
+  return alerts.sort((a, b) => ALERT_PRIORITY_META[b.priority].weight - ALERT_PRIORITY_META[a.priority].weight);
+}
+
 function computeKardex(state, productId, branchId) {
   const rows = [];
   const seqOf = (id) => id.split("_").slice(1).join("_"); // parte con precisión de milisegundos del id
@@ -908,6 +976,60 @@ function KpiCard({ label, value, sub, accent }) {
 }
 const PIE_COLORS = [T.ok, T.amber, T.orange, T.red, T.expired];
 
+function AlertsCentralTab({ state, targetBranches }) {
+  const [priorityFilter, setPriorityFilter] = useState("all");
+  const [moduleFilter, setModuleFilter] = useState("all");
+  const alerts = computeCentralAlerts(state, targetBranches.map((b) => b.id));
+  const modules = Array.from(new Set(alerts.map((a) => a.module)));
+  const filtered = alerts
+    .filter((a) => priorityFilter === "all" || a.priority === priorityFilter)
+    .filter((a) => moduleFilter === "all" || a.module === moduleFilter);
+  const counts = { alta: alerts.filter((a) => a.priority === "alta").length, media: alerts.filter((a) => a.priority === "media").length, baja: alerts.filter((a) => a.priority === "baja").length };
+  const exportRows = filtered.map((a) => ({ Prioridad: ALERT_PRIORITY_META[a.priority].label, Módulo: a.module, Alerta: a.title, Detalle: a.detail }));
+
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 14, marginBottom: 14 }}>
+        <KpiCard label="Prioridad alta" value={counts.alta} accent={T.red} />
+        <KpiCard label="Prioridad media" value={counts.media} accent={T.orange} />
+        <KpiCard label="Prioridad baja" value={counts.baja} accent={T.yellow600} />
+      </div>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <Select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+              <option value="all">Todas las prioridades</option>
+              <option value="alta">Alta</option><option value="media">Media</option><option value="baja">Baja</option>
+            </Select>
+            <Select value={moduleFilter} onChange={(e) => setModuleFilter(e.target.value)}>
+              <option value="all">Todos los módulos</option>
+              {modules.map((m) => <option key={m} value={m}>{m}</option>)}
+            </Select>
+          </div>
+          <ExportBar rows={exportRows} label="alertas" />
+        </div>
+      </Card>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {filtered.map((a, i) => (
+          <Card key={i} style={{ borderLeft: `4px solid ${ALERT_PRIORITY_META[a.priority].fg}`, padding: "12px 16px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 2 }}>
+                  <Pill bg={ALERT_PRIORITY_META[a.priority].bg} fg={ALERT_PRIORITY_META[a.priority].fg}>{ALERT_PRIORITY_META[a.priority].label}</Pill>
+                  <span style={{ fontSize: 11, color: T.gray500, fontWeight: 700, textTransform: "uppercase" }}>{a.module}</span>
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: T.ink }}>{a.title}</div>
+                <div style={{ fontSize: 12.5, color: T.gray500, marginTop: 2 }}>{a.detail}</div>
+              </div>
+            </div>
+          </Card>
+        ))}
+        {!filtered.length && <EmptyState text="No hay alertas para este filtro — todo en orden." />}
+      </div>
+    </div>
+  );
+}
+
 function DashboardView({ state, activeBranchId, role, currentUser, branches }) {
   const [tab, setTab] = useState("general");
   const isGeneral = role === "general_admin";
@@ -917,12 +1039,13 @@ function DashboardView({ state, activeBranchId, role, currentUser, branches }) {
   return (
     <div>
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }} className="no-print">
-        {[["general", "General"], ["mermas", "Mermas"], ["inventario", "Inventario Inteligente"], ["reportes", "Reportes"]].map(([k, label]) => (
+        {[["general", "General"], ["mermas", "Mermas"], ["inventario", "Inventario Inteligente"], ["alertas", "Alertas"], ["reportes", "Reportes"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ border: `1.5px solid ${tab === k ? T.green700 : T.border}`, background: tab === k ? T.green100 : "#fff", color: tab === k ? T.green700 : T.ink, borderRadius: 999, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
       {tab === "general" && <DashboardGeneralTab state={state} activeBranchId={activeBranchId} role={role} onGoToMermas={() => setTab("mermas")} />}
       {tab === "inventario" && <InventorySmartAnalysisTab state={state} isGeneral={isGeneral} branchId={branchId} />}
+      {tab === "alertas" && <AlertsCentralTab state={state} targetBranches={targetBranches} />}
       {tab === "mermas" && (
         <div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
