@@ -533,16 +533,39 @@ function recalcBranchFolios(state, branchId) {
   return folioById;
 }
 
+/* Promedio de consumo diario de un producto en una sucursal, según lo
+   detectado en los inventarios físicos finalizados de los últimos
+   `lookbackDays` días. Si todavía no hay historial (negocio recién
+   empezando), devuelve 0 — y la sugerencia de compra se comporta
+   exactamente igual que antes, solo contra el stock ideal. */
+function computeAvgDailyConsumption(state, productId, branchId, lookbackDays = 60) {
+  const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - lookbackDays);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const relevant = state.physicalInventories.filter((pi) => pi.branchId === branchId && isInventoryFinal(pi) && pi.date >= cutoffStr);
+  if (relevant.length < 2) return 0; // hace falta más de un punto para estimar un ritmo de consumo
+  const totalConsumed = relevant.flatMap((pi) => pi.consumption || []).filter((c) => c.productId === productId).reduce((s, c) => s + c.consumedPieces, 0);
+  const dates = relevant.map((pi) => pi.date).sort();
+  const spanDays = Math.max(1, (new Date(dates[dates.length - 1]) - new Date(dates[0])) / 86400000);
+  return totalConsumed / spanDays;
+}
+
 function computeSuggestedOrders(state, branchId) {
+  const safetyDays = state.config.safetyStockDays ?? 3;
+  const leadDays = state.config.leadTimeDays ?? 2;
   return state.products
     .filter((p) => p.status === "active")
     .map((p) => {
       const ideal = (p.idealStock && p.idealStock[branchId]) || 0;
       const current = theoreticalStock(state.lots, p.id, branchId);
-      const neededPieces = Math.max(0, ideal - current);
+      const avgDailyConsumption = computeAvgDailyConsumption(state, p.id, branchId);
+      const reorderPoint = Math.ceil(avgDailyConsumption * (leadDays + safetyDays));
+      const target = Math.max(ideal, reorderPoint);
+      const neededPieces = Math.max(0, target - current);
+      const cheapest = computeSupplierComparison(p, state).find((r) => r.lastCost != null);
       return {
-        productId: p.id, productName: p.name, supplierId: p.supplierId,
+        productId: p.id, productName: p.name, supplierId: cheapest?.supplierId || p.supplierId,
         piecesPerPackage: p.piecesPerPackage, idealStock: ideal, currentStock: current,
+        avgDailyConsumption: +avgDailyConsumption.toFixed(2), reorderPoint, target,
         neededPieces, neededPackages: Math.ceil(neededPieces / (p.piecesPerPackage || 1)),
       };
     })
@@ -577,7 +600,7 @@ function seedState() {
       { id: uid("usr"), username: "100", password: "1234", role: "branch_admin", name: "Encargado Sucursal Centro", branchId, status: "active", failedAttempts: 0, lockedUntil: null, lastLogin: null },
     ],
     auditLog: [],
-    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual", mermaApprovalThreshold: null, inventoryToleranceLimit: 5 },
+    config: { alertYellow: 30, alertOrange: 15, alertRed: 5, sessionTimeoutMin: 30, inventoryFrequency: "semanal", mermaPeriod: "mensual", mermaApprovalThreshold: null, inventoryToleranceLimit: 5, safetyStockDays: 3, leadTimeDays: 2 },
   };
 }
 
@@ -2998,7 +3021,7 @@ function SuggestedOrdersView({ state, branches, activeBranchId, currentUser }) {
   const exportRows = targetBranches.flatMap((b) => computeSuggestedOrders(state, b.id).map((o) => ({
     Sucursal: b.name, Proveedor: state.suppliers.find((s) => s.id === o.supplierId)?.name || "—",
     Producto: o.productName, "Stock actual": o.currentStock, "Stock ideal": o.idealStock,
-    "Piezas a pedir": o.neededPieces, "Paquetes a pedir": o.neededPackages,
+    "Consumo diario promedio": o.avgDailyConsumption, "Piezas a pedir": o.neededPieces, "Paquetes a pedir": o.neededPackages,
   })));
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -3016,8 +3039,8 @@ function SuggestedOrdersView({ state, branches, activeBranchId, currentUser }) {
               <div key={supId} style={{ marginBottom: 12 }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: T.green700, marginBottom: 4 }}>{state.suppliers.find((s) => s.id === supId)?.name}</div>
                 <table style={{ width: "100%", fontSize: 12.5 }}>
-                  <thead><tr><Th>Producto</Th><Th>Stock actual</Th><Th>Stock ideal</Th><Th>Piezas a pedir</Th><Th>Paquetes a pedir</Th></tr></thead>
-                  <tbody>{items.map((o) => <tr key={o.productId}><Td>{o.productName}</Td><Td>{o.currentStock}</Td><Td>{o.idealStock}</Td><Td><b>{o.neededPieces}</b></Td><Td><b>{o.neededPackages}</b></Td></tr>)}</tbody>
+                  <thead><tr><Th>Producto</Th><Th>Stock actual</Th><Th>Stock ideal</Th><Th>Consumo diario prom.</Th><Th>Piezas a pedir</Th><Th>Paquetes a pedir</Th></tr></thead>
+                  <tbody>{items.map((o) => <tr key={o.productId}><Td>{o.productName}</Td><Td>{o.currentStock}</Td><Td>{o.idealStock}</Td><Td>{o.avgDailyConsumption > 0 ? `${o.avgDailyConsumption} pz/día` : "—"}</Td><Td><b>{o.neededPieces}</b></Td><Td><b>{o.neededPackages}</b></Td></tr>)}</tbody>
                 </table>
               </div>
             )) : <EmptyState text="No hay pedidos sugeridos: el stock cubre el ideal en todos los productos." />}
@@ -3242,6 +3265,12 @@ function ConfigView({ state, mutate, audit, onReset }) {
           </Field>
           <Field label="Límite de tolerancia para diferencias de inventario (%)" hint="Por debajo de este % la diferencia se marca como 'menor'; por encima, como 'significativa'.">
             <TextInput type="number" min="0" step="0.1" value={cfg.inventoryToleranceLimit ?? 5} onChange={(e) => setCfg({ ...cfg, inventoryToleranceLimit: clampNum(e.target.value) })} />
+          </Field>
+          <Field label="Stock de seguridad (días)" hint="Días extra de colchón que la sugerencia de compras agrega sobre el consumo esperado.">
+            <TextInput type="number" min="0" value={cfg.safetyStockDays ?? 3} onChange={(e) => setCfg({ ...cfg, safetyStockDays: clampNum(e.target.value) })} />
+          </Field>
+          <Field label="Tiempo de reposición (días)" hint="Días que normalmente tarda en llegar un pedido, desde que se hace hasta que llega a la sucursal.">
+            <TextInput type="number" min="0" value={cfg.leadTimeDays ?? 2} onChange={(e) => setCfg({ ...cfg, leadTimeDays: clampNum(e.target.value) })} />
           </Field>
           <Field label="Periodo de análisis del estándar de mermas" hint="El estándar por sucursal se define en cada sucursal (módulo Sucursales).">
             <Select value={cfg.mermaPeriod || "mensual"} onChange={(e) => setCfg({ ...cfg, mermaPeriod: e.target.value })}>
