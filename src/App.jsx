@@ -1680,9 +1680,13 @@ function BranchesView({ state, mutate, audit }) {
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const save = (f) => {
     if (f.id) {
-      const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : (state.branches.find((b) => b.id === f.id)?.folioPrefix || suggestFolioPrefix(f.name));
+      const before = state.branches.find((b) => b.id === f.id);
+      const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : (before?.folioPrefix || suggestFolioPrefix(f.name));
+      const changes = [];
+      if (before?.name !== f.name) changes.push(`nombre: ${before?.name} → ${f.name}`);
+      if (before?.mermaStandardPercent !== f.mermaStandardPercent) changes.push(`estándar de merma: ${before?.mermaStandardPercent ?? "sin definir"}% → ${f.mermaStandardPercent ?? "sin definir"}%`);
       mutate((s) => ({ ...s, branches: s.branches.map((x) => (x.id === f.id ? { ...f, folioPrefix } : x)) }));
-      audit("Sucursales", `Editó sucursal ${f.name}`);
+      audit("Sucursales", `Editó sucursal ${f.name}`, changes.length ? changes.join(" · ") : null);
     } else {
       const folioPrefix = f.folioPrefix?.trim() ? f.folioPrefix.trim().toUpperCase() : uniqueFolioPrefix(f.name, state.branches);
       mutate((s) => ({ ...s, branches: [...s.branches, { ...f, folioPrefix, id: uid("suc"), status: "active" }] }));
@@ -3029,6 +3033,7 @@ const REPORT_TYPES = [
   "Existencias actuales", "Productos próximos a caducar", "Mermas por caducidad", "Facturas pendientes de pago",
   "Facturas pagadas", "Consumo por sucursal", "Compras por proveedor", "Comparativo de consumo entre sucursales",
   "Historial de pedidos sugeridos", "Comparativo de inventario físico", "Impacto de inventario físico", "Histórico de inventarios físicos",
+  "Variación de costos",
 ];
 function ReportsView({ state, branches }) {
   const [type, setType] = useState(REPORT_TYPES[0]);
@@ -3058,7 +3063,30 @@ function ReportsView({ state, branches }) {
     const st = type === "Facturas pagadas" ? "paid" : "pending";
     rows = state.invoices.filter((i) => i.status === st && (branchFilter === "all" || i.branchId === branchFilter)).map((i) => ({ Factura: i.invoiceNumber, Proveedor: state.suppliers.find((s) => s.id === i.supplierId)?.name, Sucursal: state.branches.find((b) => b.id === i.branchId)?.name, Ingreso: fmtDate(i.entryDate), Total: fmtMoney(i.total) }));
   } else if (type === "Consumo por sucursal" || type === "Comparativo de consumo entre sucursales") {
-    rows = state.branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => ({ Sucursal: b.name, "Consumo total (pz)": state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).flatMap((pi) => pi.consumption).reduce((s, c) => s + c.consumedPieces, 0), "Inventarios realizados": state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).length }));
+    rows = state.branches.filter((b) => branchFilter === "all" || b.id === branchFilter).map((b) => {
+      const entradas = state.invoices.filter((i) => i.branchId === b.id && i.status !== "cancelled")
+        .flatMap((i) => i.items || []).reduce((s, it) => { const p = state.products.find((pp) => pp.id === it.productId); return s + it.packages * (p?.piecesPerPackage || 0) + (it.looseUnits || 0); }, 0);
+      const mermas = state.mermas.filter((m) => m.branchId === b.id && m.status !== "cancelled").reduce((s, m) => s + m.quantity, 0);
+      const consumo = state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).flatMap((pi) => pi.consumption).reduce((s, c) => s + c.consumedPieces, 0);
+      const invFinal = state.products.filter((p) => p.status === "active").reduce((s, p) => s + theoreticalStock(state.lots, p.id, b.id), 0);
+      const invInicial = consumo + invFinal + mermas - entradas;
+      return {
+        Sucursal: b.name, "Inventario inicial (pz)": Math.max(0, Math.round(invInicial)), "Entradas (pz)": entradas,
+        "Inventario final (pz)": invFinal, "Mermas (pz)": mermas, "Consumo total (pz)": consumo,
+        "Inventarios realizados": state.physicalInventories.filter((pi) => pi.branchId === b.id && isInventoryFinal(pi)).length,
+      };
+    });
+  } else if (type === "Variación de costos") {
+    rows = state.products.filter((p) => p.status === "active" && (p.costHistory || []).length > 0).map((p) => {
+      const hist = [...p.costHistory].sort((a, b) => a.date.localeCompare(b.date));
+      const last = hist[hist.length - 1]; const prev = hist[hist.length - 2];
+      const pct = prev && prev.costPerPackage ? ((last.costPerPackage - prev.costPerPackage) / prev.costPerPackage) * 100 : null;
+      return {
+        Producto: p.name, "Costo anterior": prev ? fmtMoney(prev.costPerPackage) : "—", "Costo actual": fmtMoney(last.costPerPackage),
+        "Variación %": pct != null ? `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%` : "—", Fecha: fmtDate(last.date),
+        Proveedor: state.suppliers.find((s) => s.id === last.supplierId)?.name || "—",
+      };
+    });
   } else if (type === "Compras por proveedor") {
     rows = state.suppliers.map((s) => ({ Proveedor: s.name, "Total comprado": fmtMoney(state.invoices.filter((i) => i.supplierId === s.id && i.status !== "cancelled" && (branchFilter === "all" || i.branchId === branchFilter)).reduce((sum, i) => sum + i.total, 0)) }));
   } else if (type === "Historial de pedidos sugeridos") {
@@ -3127,8 +3155,8 @@ function ReportsView({ state, branches }) {
 /* ============================== BITÁCORA ============================== */
 function AuditLogView({ state }) {
   const [q, setQ] = useState("");
-  const rows = [...state.auditLog].reverse().filter((r) => (r.user + r.module + r.action).toLowerCase().includes(q.toLowerCase()));
-  const exportRows = rows.map((r) => ({ Fecha: r.date, Hora: r.time, Usuario: r.user, Rol: r.role, Módulo: r.module, Acción: r.action }));
+  const rows = [...state.auditLog].reverse().filter((r) => (r.user + r.module + r.action + (r.branch || "")).toLowerCase().includes(q.toLowerCase()));
+  const exportRows = rows.map((r) => ({ Fecha: r.date, Hora: r.time, Usuario: r.user, Rol: r.role, Sucursal: r.branch || "—", Módulo: r.module, Acción: r.action, Detalle: r.details || "" }));
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
@@ -3137,8 +3165,13 @@ function AuditLogView({ state }) {
       </div>
       <Card style={{ padding: 0, overflow: "auto", maxHeight: 560 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr><Th>Fecha</Th><Th>Hora</Th><Th>Usuario</Th><Th>Rol</Th><Th>Módulo</Th><Th>Acción</Th></tr></thead>
-          <tbody>{rows.map((r) => <tr key={r.id}><Td>{r.date}</Td><Td mono>{r.time}</Td><Td>{r.user}</Td><Td>{r.role}</Td><Td>{r.module}</Td><Td>{r.action}</Td></tr>)}</tbody>
+          <thead><tr><Th>Fecha</Th><Th>Hora</Th><Th>Usuario</Th><Th>Rol</Th><Th>Sucursal</Th><Th>Módulo</Th><Th>Acción</Th></tr></thead>
+          <tbody>{rows.map((r) => (
+            <tr key={r.id}>
+              <Td>{r.date}</Td><Td mono>{r.time}</Td><Td>{r.user}</Td><Td>{r.role}</Td><Td>{r.branch || "—"}</Td><Td>{r.module}</Td>
+              <Td>{r.action}{r.details && <div style={{ fontSize: 11, color: T.gray500, marginTop: 2 }}>{r.details}</div>}</Td>
+            </tr>
+          ))}</tbody>
         </table>
         {!rows.length && <EmptyState text="Sin actividad registrada." />}
       </Card>
@@ -3153,7 +3186,12 @@ function ConfigView({ state, mutate, audit, onReset }) {
   const [restoreFile, setRestoreFile] = useState(null);
   const [restoreError, setRestoreError] = useState("");
   const fileInputRef = useRef(null);
-  const save = () => { mutate((s) => ({ ...s, config: cfg })); audit("Configuración", "Actualizó los parámetros generales del sistema"); };
+  const save = () => {
+    const changed = Object.keys(cfg).filter((k) => cfg[k] !== state.config[k]);
+    const detail = changed.length ? changed.map((k) => `${k}: ${state.config[k]} → ${cfg[k]}`).join(" · ") : null;
+    mutate((s) => ({ ...s, config: cfg }));
+    audit("Configuración", "Actualizó los parámetros generales del sistema", detail);
+  };
 
   const downloadBackup = () => {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
@@ -3335,11 +3373,14 @@ function SubGestorAppInner() {
     };
   }, [refreshFromShared]);
 
-  const audit = useCallback((module, action) => {
+  const audit = useCallback((module, action, details) => {
     if (!session) return;
     const u = session.user; const { date, time } = nowStamp();
-    mutate((s) => ({ ...s, auditLog: [...s.auditLog, { id: uid("log"), user: u.name, role: u.role === "general_admin" ? "Administrador General" : "Administrador de Sucursal", branch: state.branches.find((b) => b.id === u.branchId)?.name || "—", date, time, module, action }] }));
-  }, [session, mutate, state]);
+    const branchName = u.branchId
+      ? (state.branches.find((b) => b.id === u.branchId)?.name || "—")
+      : (activeBranchId ? (state.branches.find((b) => b.id === activeBranchId)?.name || "—") : "Todas las sucursales");
+    mutate((s) => ({ ...s, auditLog: [...s.auditLog, { id: uid("log"), user: u.name, role: u.role === "general_admin" ? "Administrador General" : "Administrador de Sucursal", branch: branchName, date, time, module, action, details: details || null }] }));
+  }, [session, mutate, state, activeBranchId]);
 
   const handleLogin = ({ type, userId }) => {
     if (type === "failed_attempt") {
