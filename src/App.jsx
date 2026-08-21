@@ -4,7 +4,7 @@ import {
   AlertTriangle, ClipboardList, ShoppingCart, BarChart3, Settings as SettingsIcon,
   LogOut, Plus, Search, X, Pencil, Trash2, Ban, Image as ImageIcon,
   ChevronDown, Download, Printer, Lock, Eye, EyeOff, CheckCircle2,
-  RotateCcw, Boxes, Store, ScrollText, KeyRound, RefreshCw
+  RotateCcw, Boxes, Store, ScrollText, KeyRound, RefreshCw, Menu
 } from "lucide-react";
 import {
   BarChart, Bar, PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis,
@@ -932,7 +932,7 @@ function NavItem({ icon: Icon, label, active, onClick }) {
   );
 }
 
-function Sidebar({ view, setView, role, onLogout }) {
+function Sidebar({ view, setView, role, onLogout, mobileOpen, onClose }) {
   const general = [
     ["dashboard", LayoutDashboard], ["productos", Package], ["proveedores", Truck],
     ["facturas", FileText], ["inventario", ClipboardList], ["alertas", AlertTriangle],
@@ -940,45 +940,48 @@ function Sidebar({ view, setView, role, onLogout }) {
   ];
   const adminOnly = [["sucursales", Building2], ["usuarios", UsersIcon], ["bitacora", ScrollText], ["config", SettingsIcon]];
   const items = role === "general_admin" ? [...general.slice(0, 3), ...adminOnly.slice(0, 2), ...general.slice(3), ...adminOnly.slice(2)] : general;
+  const goTo = (key) => { setView(key); if (onClose) onClose(); };
   return (
-    <div style={{ width: 232, background: T.green900, minHeight: "100vh", padding: "22px 14px", display: "flex", flexDirection: "column", flexShrink: 0 }} className="no-print">
-      <div style={{ padding: "0 8px 20px 8px" }}>
+    <div className={`app-sidebar no-print${mobileOpen ? " open" : ""}`} style={{ width: 232, background: T.green900, minHeight: "100vh", padding: "22px 14px", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+      <div style={{ padding: "0 8px 20px 8px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
           <svg width={30} height={30} viewBox="0 0 48 48"><rect x="1" y="1" width="46" height="46" rx="14" fill={T.yellow500} /><path d="M32 16c-2-1.6-5-2.4-8-2.4-5 0-8 2-8 5.4 0 3.2 3 4.4 7 5.2 4.6 1 5.6 1.8 5.6 3.2 0 1.6-1.8 2.6-4.4 2.6-3 0-5.6-1-7.8-2.8l-2.6 3.6c2.6 2.2 6.2 3.4 10.2 3.4 5.6 0 9-2.6 9-6.4 0-3.6-2.6-4.8-7.2-5.8-4.4-1-5.4-1.6-5.4-3 0-1.4 1.6-2.2 3.8-2.2 2.4 0 4.6.8 6.6 2.2l2.2-3z" fill={T.green900} /></svg>
           <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 18, color: "#fff" }}>SubGestor</span>
         </div>
+        <button className="sidebar-close-btn" onClick={onClose} style={{ background: "transparent", border: "none", color: "#fff", cursor: "pointer", padding: 4 }}><X size={20} /></button>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1 }}>
-        {items.map(([key, Icon]) => <NavItem key={key} icon={Icon} label={MODULES[key]} active={view === key} onClick={() => setView(key)} />)}
+        {items.map(([key, Icon]) => <NavItem key={key} icon={Icon} label={MODULES[key]} active={view === key} onClick={() => goTo(key)} />)}
       </div>
       <NavItem icon={LogOut} label="Cerrar sesión" onClick={onLogout} />
     </div>
   );
 }
 
-function TopBar({ user, branches, activeBranchId, setActiveBranchId, onRefresh, syncing }) {
+function TopBar({ user, branches, activeBranchId, setActiveBranchId, onRefresh, syncing, onToggleMenu }) {
   const branch = branches.find((b) => b.id === activeBranchId);
   return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 26px", borderBottom: `1px solid ${T.border}`, background: "#fff" }} className="no-print">
-      <div>
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${T.border}`, background: "#fff", gap: 10, flexWrap: "wrap" }} className="no-print">
+      <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+        <button className="hamburger-btn" onClick={onToggleMenu} aria-label="Abrir menú" style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, display: "none", flexShrink: 0 }}><Menu size={22} color={T.ink} /></button>
         {user.role === "general_admin" ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Store size={16} color={T.gray500} />
-            <Select value={activeBranchId || "all"} onChange={(e) => setActiveBranchId(e.target.value === "all" ? null : e.target.value)} style={{ fontWeight: 700 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <Store size={16} color={T.gray500} style={{ flexShrink: 0 }} />
+            <Select value={activeBranchId || "all"} onChange={(e) => setActiveBranchId(e.target.value === "all" ? null : e.target.value)} style={{ fontWeight: 700, maxWidth: "100%" }}>
               <option value="all">Todas las sucursales (consolidado)</option>
               {branches.map((b) => <option key={b.id} value={b.id}>#{b.number} · {b.name}</option>)}
             </Select>
           </div>
         ) : (
-          <div style={{ fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", gap: 8, color: T.green700 }}><Store size={16} />{branch ? `#${branch.number} · ${branch.name}` : "Sin sucursal"}</div>
+          <div style={{ fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", gap: 8, color: T.green700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><Store size={16} style={{ flexShrink: 0 }} />{branch ? `#${branch.number} · ${branch.name}` : "Sin sucursal"}</div>
         )}
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 14, fontSize: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, fontSize: 13, flexShrink: 0 }}>
         <button onClick={onRefresh} title="Actualizar con los datos más recientes" style={{ display: "flex", alignItems: "center", gap: 5, background: T.cream, border: `1px solid ${T.border}`, borderRadius: 8, padding: "6px 10px", cursor: "pointer", fontSize: 12, color: T.gray500, fontWeight: 600 }}>
-          <RefreshCw size={13} style={syncing ? { animation: "sg-spin 0.8s linear infinite" } : undefined} /> {syncing ? "Actualizando…" : "Actualizar"}
+          <RefreshCw size={13} style={syncing ? { animation: "sg-spin 0.8s linear infinite" } : undefined} /> <span className="topbar-refresh-label">{syncing ? "Actualizando…" : "Actualizar"}</span>
         </button>
-        <div style={{ width: 30, height: 30, borderRadius: 999, background: T.green100, color: T.green700, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>{user.name.charAt(0)}</div>
-        <div>
+        <div style={{ width: 30, height: 30, borderRadius: 999, background: T.green100, color: T.green700, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, flexShrink: 0 }}>{user.name.charAt(0)}</div>
+        <div className="topbar-userinfo-text">
           <div style={{ fontWeight: 700 }}>{user.name}</div>
           <div style={{ color: T.gray500, fontSize: 11.5 }}>{user.role === "general_admin" ? "Administrador General" : "Administrador de Sucursal"}</div>
         </div>
@@ -3329,6 +3332,7 @@ function SubGestorAppInner() {
   const [session, setSession] = useState(null);
   const [view, setView] = useState("dashboard");
   const [activeBranchId, setActiveBranchId] = useState(null);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const saveTimer = useRef(null);
   const lastActivity = useRef(Date.now());
 
@@ -3462,6 +3466,27 @@ function SubGestorAppInner() {
         .print-only { display:flex !important; }
         body { background:#fff; }
       }
+      .sidebar-close-btn { display:none; }
+      .sidebar-backdrop { display:none; position:fixed; inset:0; background:rgba(15,42,30,0.5); z-index:150; }
+      @media (max-width: 900px) {
+        .app-sidebar {
+          position: fixed; top:0; left:0; height:100vh; z-index:200;
+          transform: translateX(-100%);
+          transition: transform 0.22s ease;
+          box-shadow: 6px 0 28px rgba(0,0,0,0.28);
+          overflow-y: auto;
+        }
+        .app-sidebar.open { transform: translateX(0); }
+        .sidebar-close-btn { display:block; }
+        .hamburger-btn { display:flex !important; }
+        .topbar-userinfo-text { display:none; }
+        .topbar-refresh-label { display:none; }
+        .content-pad { padding: 12px !important; }
+        .sidebar-backdrop.open { display:block; }
+      }
+      @media (max-width: 480px) {
+        .content-pad { padding: 8px !important; }
+      }
     `}</style>
   );
 
@@ -3487,10 +3512,11 @@ function SubGestorAppInner() {
   return (
     <div style={{ display: "flex", fontFamily: "'Inter',sans-serif", background: T.cream, minHeight: "100vh" }}>
       {globalStyle}
-      <Sidebar view={view} setView={setView} role={session.user.role} onLogout={handleLogout} />
+      <div className={`sidebar-backdrop${mobileMenuOpen ? " open" : ""}`} onClick={() => setMobileMenuOpen(false)} />
+      <Sidebar view={view} setView={setView} role={session.user.role} onLogout={handleLogout} mobileOpen={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <TopBar user={session.user} branches={branches} activeBranchId={activeBranchId} setActiveBranchId={setActiveBranchId} onRefresh={refreshFromShared} syncing={syncing} />
-        <div style={{ padding: 24 }}>
+        <TopBar user={session.user} branches={branches} activeBranchId={activeBranchId} setActiveBranchId={setActiveBranchId} onRefresh={refreshFromShared} syncing={syncing} onToggleMenu={() => setMobileMenuOpen((o) => !o)} />
+        <div className="content-pad" style={{ padding: 24 }}>
           <div className="print-only" style={{ display: "none", alignItems: "center", gap: 10, marginBottom: 16, paddingBottom: 12, borderBottom: `2px solid ${T.green700}` }}>
             <Logo size={30} />
             <div style={{ marginLeft: "auto", textAlign: "right", fontSize: 11, color: T.gray500 }}>
