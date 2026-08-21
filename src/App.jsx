@@ -699,7 +699,7 @@ function EmptyState({ text }) {
   return <div style={{ padding: 30, textAlign: "center", color: T.gray500, fontSize: 13 }}>{text}</div>;
 }
 function Th({ children }) { return <th style={{ textAlign: "left", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.4, color: T.gray500, padding: "8px 10px", borderBottom: `2px solid ${T.border}` }}>{children}</th>; }
-function Td({ children, mono }) { return <td style={{ padding: "10px 10px", borderBottom: `1px solid ${T.border}`, fontSize: 13, fontFamily: mono ? "'IBM Plex Mono',monospace" : "'Inter',sans-serif", color: T.ink }}>{children}</td>; }
+function Td({ children, mono, label }) { return <td data-label={label} style={{ padding: "10px 10px", borderBottom: `1px solid ${T.border}`, fontSize: 13, fontFamily: mono ? "'IBM Plex Mono',monospace" : "'Inter',sans-serif", color: T.ink }}>{children}</td>; }
 
 function buildCSV(rows) {
   if (!rows.length) return "";
@@ -1612,7 +1612,7 @@ function ProductsView({ state, mutate, branches, activeBranchId, currentUser, au
         <Btn icon={Plus} onClick={() => setShowForm(true)}>Alta de producto</Btn>
       </div>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Producto</Th><Th>Código</Th><Th>Proveedor</Th><Th>Presentación</Th><Th>Existencia</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {list.map((p) => {
@@ -1620,16 +1620,16 @@ function ProductsView({ state, mutate, branches, activeBranchId, currentUser, au
               const stock = theoreticalStock(state.lots, p.id, branchForStock);
               return (
                 <tr key={p.id}>
-                  <Td><div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <Td label="Producto"><div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     {p.image ? <img src={p.image} alt="" style={{ width: 28, height: 28, borderRadius: 6, objectFit: "cover" }} /> : <div style={{ width: 28, height: 28, borderRadius: 6, background: T.green100 }} />}
                     <b>{p.name}</b></div></Td>
-                  <Td mono>{p.code}</Td>
-                  <Td>{supplier?.name || "—"}</Td>
-                  <Td>{p.piecesPerPackage} pz/paq</Td>
-                  <Td>{unit === "piezas" ? `${stock} pz` : packagesAndPieces(stock, p.piecesPerPackage)}</Td>
-                  <Td><StatusPill status={p.status} /></Td>
+                  <Td label="Código" mono>{p.code}</Td>
+                  <Td label="Proveedor">{supplier?.name || "—"}</Td>
+                  <Td label="Presentación">{p.piecesPerPackage} pz/paq</Td>
+                  <Td label="Existencia">{unit === "piezas" ? `${stock} pz` : packagesAndPieces(stock, p.piecesPerPackage)}</Td>
+                  <Td label="Estado"><StatusPill status={p.status} /></Td>
                   <Td>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                       <button onClick={() => { setEditing(p); setShowForm(true); }} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Pencil size={13} /></button>
                       <button onClick={() => toggleStatus(p)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Ban size={13} color={p.status === "active" ? T.red : T.green700} /></button>
                       <Btn small variant="secondary" onClick={() => setKardexProductId(p.id)}>Kardex</Btn>
@@ -1667,13 +1667,13 @@ function SuppliersView({ state, mutate, audit }) {
         <Btn icon={Plus} onClick={() => setForm({ name: "", productTypes: "", paymentDueDays: 30 })}>Alta de proveedor</Btn>
       </div>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Proveedor</Th><Th>Tipo de productos</Th><Th>Crédito (días)</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {state.suppliers.map((s) => (
               <tr key={s.id}>
-                <Td><b>{s.name}</b></Td><Td>{s.productTypes}</Td><Td>{s.paymentDueDays} días</Td><Td><StatusPill status={s.status} /></Td>
-                <Td><div style={{ display: "flex", gap: 6 }}>
+                <Td label="Proveedor"><b>{s.name}</b></Td><Td label="Tipo de productos">{s.productTypes}</Td><Td label="Crédito (días)">{s.paymentDueDays} días</Td><Td label="Estado"><StatusPill status={s.status} /></Td>
+                <Td><div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                   <button onClick={() => setForm(s)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Pencil size={13} /></button>
                   <button onClick={() => toggle(s)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Ban size={13} color={s.status === "active" ? T.red : T.green700} /></button>
                 </div></Td>
@@ -1814,17 +1814,17 @@ function UsersView({ state, mutate, audit }) {
         <Btn icon={Plus} onClick={() => setForm({ username: "", password: "", name: "", role: "branch_admin", branchId: state.branches[0]?.id || "" })}>Nuevo usuario</Btn>
       </div>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Nombre</Th><Th>Usuario</Th><Th>Rol</Th><Th>Sucursal</Th><Th>Último acceso</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {state.users.map((u) => (
               <tr key={u.id}>
-                <Td><b>{u.name}</b></Td><Td mono>{u.username}</Td>
-                <Td>{u.role === "general_admin" ? "Administrador General" : "Administrador de Sucursal"}</Td>
-                <Td>{state.branches.find((b) => b.id === u.branchId)?.name || "—"}</Td>
-                <Td>{u.lastLogin ? `${u.lastLogin.date} ${u.lastLogin.time}` : "—"}</Td>
-                <Td>{u.lockedUntil && Date.now() < u.lockedUntil ? <Pill bg="#FBDCDA" fg={T.red}>Bloqueado</Pill> : <StatusPill status={u.status} />}</Td>
-                <Td><div style={{ display: "flex", gap: 6 }}>
+                <Td label="Nombre"><b>{u.name}</b></Td><Td label="Usuario" mono>{u.username}</Td>
+                <Td label="Rol">{u.role === "general_admin" ? "Administrador General" : "Administrador de Sucursal"}</Td>
+                <Td label="Sucursal">{state.branches.find((b) => b.id === u.branchId)?.name || "—"}</Td>
+                <Td label="Último acceso">{u.lastLogin ? `${u.lastLogin.date} ${u.lastLogin.time}` : "—"}</Td>
+                <Td label="Estado">{u.lockedUntil && Date.now() < u.lockedUntil ? <Pill bg="#FBDCDA" fg={T.red}>Bloqueado</Pill> : <StatusPill status={u.status} />}</Td>
+                <Td><div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                   <button onClick={() => setForm(u)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Pencil size={13} /></button>
                   {u.lockedUntil && <button onClick={() => unlock(u)} title="Desbloquear" style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><KeyRound size={13} /></button>}
                   <button onClick={() => toggle(u)} style={{ border: "none", background: T.cream, borderRadius: 7, padding: 6, cursor: "pointer" }}><Ban size={13} color={u.status === "active" ? T.red : T.green700} /></button>
@@ -2032,7 +2032,7 @@ function InvoicesView({ state, mutate, branches, activeBranchId, currentUser, au
         </div>
       </div>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Factura</Th><Th>Proveedor</Th><Th>Sucursal</Th><Th>Ingreso</Th><Th>Total</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {list.map((inv) => {
@@ -2040,8 +2040,8 @@ function InvoicesView({ state, mutate, branches, activeBranchId, currentUser, au
               const br = state.branches.find((b) => b.id === inv.branchId);
               return (
                 <tr key={inv.id}>
-                  <Td mono>{inv.invoiceNumber}</Td><Td>{sup?.name}</Td><Td>{br?.name}</Td><Td>{fmtDate(inv.entryDate)}</Td><Td>{fmtMoney(inv.total)}</Td><Td><StatusPill status={inv.status} /></Td>
-                  <Td><div style={{ display: "flex", gap: 6 }}>
+                  <Td label="Factura" mono>{inv.invoiceNumber}</Td><Td label="Proveedor">{sup?.name}</Td><Td label="Sucursal">{br?.name}</Td><Td label="Ingreso">{fmtDate(inv.entryDate)}</Td><Td label="Total">{fmtMoney(inv.total)}</Td><Td label="Estado"><StatusPill status={inv.status} /></Td>
+                  <Td><div style={{ display: "flex", gap: 6, justifyContent: "flex-end", flexWrap: "wrap" }}>
                     {inv.status !== "cancelled" && <Btn small variant="ghost" onClick={() => setGate(() => () => { setEditTarget(inv); setShowForm(true); })}>Editar</Btn>}
                     {inv.status === "pending" && <Btn small variant="secondary" onClick={() => setGate(() => () => markPaid(inv))}>Marcar pagada</Btn>}
                     {inv.status !== "cancelled" && <Btn small variant="danger" onClick={() => setGate(() => () => setCancelTarget(inv))}>Cancelar</Btn>}
@@ -2449,17 +2449,17 @@ function PhysicalInventoryView({ state, mutate, currentUser, activeBranchId, aud
         {!branchId && <div style={{ color: T.red, fontSize: 12.5, fontWeight: 600, marginTop: 6 }}>Selecciona una sucursal para crear un inventario.</div>}
       </Card>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Folio</Th><Th>Fecha</Th><Th>Tipo</Th><Th>Sucursal</Th><Th>Responsable(s)</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {list.map((pi) => (
               <tr key={pi.id}>
-                <Td mono>{pi.folio}</Td><Td>{fmtDate(pi.date)}</Td><Td>{INV_TYPES[pi.type] || "Inventario Físico"}</Td>
-                <Td>{state.branches.find((b) => b.id === pi.branchId)?.name || "—"}</Td>
-                <Td>{(pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", ") || "—"}</Td>
-                <Td><div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}><InvStatusPill pi={pi} />{pi.requiresAuthorization && !pi.authorized && <Pill bg="#FDE6D2" fg={T.orange}>Requiere autorización</Pill>}</div></Td>
+                <Td label="Folio" mono>{pi.folio}</Td><Td label="Fecha">{fmtDate(pi.date)}</Td><Td label="Tipo">{INV_TYPES[pi.type] || "Inventario Físico"}</Td>
+                <Td label="Sucursal">{state.branches.find((b) => b.id === pi.branchId)?.name || "—"}</Td>
+                <Td label="Responsable(s)">{(pi.responsibles || [pi.registeredBy]).filter(Boolean).join(", ") || "—"}</Td>
+                <Td label="Estado"><div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}><InvStatusPill pi={pi} />{pi.requiresAuthorization && !pi.authorized && <Pill bg="#FDE6D2" fg={T.orange}>Requiere autorización</Pill>}</div></Td>
                 <Td>
-                  <div style={{ display: "flex", gap: 6 }}>
+                  <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", flexWrap: "wrap" }}>
                     <Btn small variant="secondary" onClick={() => setOpenId(pi.id)}>{isInventoryOpen(pi) ? "Continuar" : "Ver detalle"}</Btn>
                     {isGeneral && pi.status !== "cancelado" && <Btn small variant="danger" onClick={() => setCancelTarget(pi)}>Cancelar</Btn>}
                   </div>
@@ -2539,16 +2539,16 @@ function ExpiryAlertsView({ state, mutate, branches, activeBranchId, currentUser
         <ExportBar rows={exportRows} label="alertas de caducidad" />
       </div>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Producto</Th><Th>Sucursal</Th><Th>Caducidad</Th><Th>Semáforo</Th><Th>Piezas restantes</Th><Th></Th></tr></thead>
           <tbody>
             {lots.map((l) => (
               <tr key={l.id}>
-                <Td><b>{state.products.find((p) => p.id === l.productId)?.name}</b></Td>
-                <Td>{state.branches.find((b) => b.id === l.branchId)?.name}</Td>
-                <Td>{fmtDate(l.expirationDate)}</Td>
-                <Td><SemPill dateStr={l.expirationDate} cfg={state.config} /></Td>
-                <Td>{l.remainingPieces}</Td>
+                <Td label="Producto"><b>{state.products.find((p) => p.id === l.productId)?.name}</b></Td>
+                <Td label="Sucursal">{state.branches.find((b) => b.id === l.branchId)?.name}</Td>
+                <Td label="Caducidad">{fmtDate(l.expirationDate)}</Td>
+                <Td label="Semáforo"><SemPill dateStr={l.expirationDate} cfg={state.config} /></Td>
+                <Td label="Piezas restantes">{l.remainingPieces}</Td>
                 <Td>{l.level === "expired" && <Btn small variant="danger" onClick={() => registerMerma(l)}>Registrar merma</Btn>}</Td>
               </tr>
             ))}
@@ -2958,21 +2958,21 @@ function MermasView({ state, mutate, branches, activeBranchId, currentUser, audi
         <div style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 24, fontWeight: 700, color: T.ink }}>{fmtMoney(totalCostShown)}</div>
       </Card>
       <Card style={{ padding: 0, overflow: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <table className="responsive-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr><Th>Fecha</Th><Th>Producto</Th><Th>Sucursal</Th><Th>Clasificación</Th><Th>Cantidad</Th><Th>Costo total</Th><Th>Responsable</Th><Th>Estado</Th><Th></Th></tr></thead>
           <tbody>
             {list.map((m) => (
               <tr key={m.id}>
-                <Td>{fmtDate(m.date)}</Td>
-                <Td><b>{state.products.find((p) => p.id === m.productId)?.name || "—"}</b></Td>
-                <Td>{state.branches.find((b) => b.id === m.branchId)?.name || "—"}</Td>
-                <Td><MermaClassPill classification={m.classification} /></Td>
-                <Td>{m.quantity} {m.unit}</Td>
-                <Td>{fmtMoney(m.totalCost)}</Td>
-                <Td>{m.responsible}</Td>
-                <Td><StatusPill status={m.status === "cancelled" ? "cancelled" : m.status === "pending_approval" ? "pending_approval" : "active"} /></Td>
+                <Td label="Fecha">{fmtDate(m.date)}</Td>
+                <Td label="Producto"><b>{state.products.find((p) => p.id === m.productId)?.name || "—"}</b></Td>
+                <Td label="Sucursal">{state.branches.find((b) => b.id === m.branchId)?.name || "—"}</Td>
+                <Td label="Clasificación"><MermaClassPill classification={m.classification} /></Td>
+                <Td label="Cantidad">{m.quantity} {m.unit}</Td>
+                <Td label="Costo total">{fmtMoney(m.totalCost)}</Td>
+                <Td label="Responsable">{m.responsible}</Td>
+                <Td label="Estado"><StatusPill status={m.status === "cancelled" ? "cancelled" : m.status === "pending_approval" ? "pending_approval" : "active"} /></Td>
                 <Td>
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                     {m.photoEvidence && <Btn small variant="ghost" onClick={() => setEvidenceView(m.photoEvidence)}>Ver foto</Btn>}
                     {m.status === "pending_approval" && isGeneral && <Btn small variant="secondary" onClick={() => approveMerma(m)}>Aprobar</Btn>}
                     {m.status === "pending_approval" && isGeneral && <Btn small variant="danger" onClick={() => setRejectTarget(m)}>Rechazar</Btn>}
@@ -3486,6 +3486,16 @@ function SubGestorAppInner() {
       }
       @media (max-width: 480px) {
         .content-pad { padding: 8px !important; }
+      }
+      @media (max-width: 700px) {
+        table.responsive-table thead { display:none; }
+        table.responsive-table, table.responsive-table tbody, table.responsive-table tr, table.responsive-table td { display:block; width:100%; }
+        table.responsive-table tr { border: 1px solid ${T.border}; border-radius: 10px; margin-bottom: 10px; padding: 4px 2px; background:#fff; }
+        table.responsive-table td { display:flex; justify-content:space-between; align-items:center; gap:12px; text-align:right; border-bottom: 1px solid #F1EEE4; padding: 8px 10px; }
+        table.responsive-table td:last-child { border-bottom:none; }
+        table.responsive-table td[data-label]::before { content: attr(data-label); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.3px; color:${T.gray500}; text-align:left; flex-shrink:0; }
+        table.responsive-table td:not([data-label]) { justify-content:flex-end; }
+        table.responsive-table td:not([data-label]):empty { display:none; }
       }
     `}</style>
   );
